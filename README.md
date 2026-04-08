@@ -47,7 +47,7 @@ This app implements the **server (stub) side** of that protocol on Android. You 
 ```
 
 1. **Device enumeration** – The app uses Android's `UsbManager` API to list all connected USB devices and their descriptors (vendor ID, product ID, class, interfaces, endpoints).
-2. **TCP server** – A background foreground service starts a TCP server on port **3240** (the standard USB/IP port).
+2. **TCP server** – A foreground service starts a TCP server on port **3240** (the standard USB/IP port).
 3. **USB/IP handshake** – When a client connects, the server responds to `OP_REQ_DEVLIST` (list available devices) and `OP_REQ_IMPORT` (attach to a device) requests using the standard USB/IP wire protocol.
 4. **URB forwarding** – Once a device is claimed, every USB Request Block (URB) sent by the client (`USBIP_CMD_SUBMIT`) is translated into a real USB transfer on the Android side:
    - **Bulk transfers** are performed via the `USBDEVFS_BULK` ioctl through a native JNI library (`libusblib.so`), which bypasses Android's Java USB API to achieve lower latency.
@@ -253,7 +253,7 @@ To install outside of the Play Store you need a signed APK.
          │ Control channel       │ Device channel
          │ (OP_REQ_DEVLIST /     │ (USBIP_CMD_SUBMIT /
          │  OP_REQ_IMPORT)       │  USBIP_CMD_UNLINK)
-         └──────────────────────-┘
+         └───────────────────────┘
                      │
 ┌────────────────────▼─────────────────────┐
 │    XferUtils  +  UsbLib (JNI)            │
