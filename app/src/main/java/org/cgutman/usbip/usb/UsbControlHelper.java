@@ -31,6 +31,10 @@ public class UsbControlHelper {
 	
 	private static final int DEVICE_DESCRIPTOR_TYPE = 1;
 
+	/**
+	 * Initializes the active interface map by selecting one alternate setting per interface
+	 * (preferably alternate setting 0) from the current active configuration.
+	 */
 	public static void populateDefaultActiveInterfaces(AttachedDeviceContext deviceContext) {
 		deviceContext.activeInterfacesById = new SparseArray<>();
 		if (deviceContext.activeConfiguration == null) {
@@ -47,6 +51,9 @@ public class UsbControlHelper {
 		}
 	}
 
+	/**
+	 * Rebuilds the endpoint cache from the currently active interface alternates.
+	 */
 	private static void populateActiveEndpointMap(AttachedDeviceContext deviceContext) {
 		deviceContext.activeConfigurationEndpointsByNumDir = new SparseArray<>();
 		if (deviceContext.activeInterfacesById == null) {
@@ -64,6 +71,9 @@ public class UsbControlHelper {
 		}
 	}
 
+	/**
+	 * Releases all currently active interfaces tracked in the context.
+	 */
 	private static void releaseActiveInterfaces(AttachedDeviceContext deviceContext) {
 		if (deviceContext.activeInterfacesById == null) {
 			return;
@@ -75,6 +85,9 @@ public class UsbControlHelper {
 		}
 	}
 
+	/**
+	 * Claims all currently active interfaces tracked in the context.
+	 */
 	private static void claimActiveInterfaces(AttachedDeviceContext deviceContext) {
 		if (deviceContext.activeInterfacesById == null) {
 			return;

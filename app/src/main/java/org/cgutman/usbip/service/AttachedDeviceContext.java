@@ -16,6 +16,7 @@ public class AttachedDeviceContext {
     public UsbDevice device;
     public UsbDeviceConnection devConn;
     public UsbConfiguration activeConfiguration;
+    // Active alternate setting per interface ID within activeConfiguration.
     public SparseArray<UsbInterface> activeInterfacesById;
     public SparseArray<UsbEndpoint> activeConfigurationEndpointsByNumDir;
     public ThreadPoolExecutor requestPool;
