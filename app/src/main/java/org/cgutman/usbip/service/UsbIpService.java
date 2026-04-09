@@ -68,6 +68,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 	
 	private static final boolean DEBUG = false;
 	private static final int MAX_URB_TRANSFER_BUFFER_LENGTH = 16 * 1024 * 1024;
+	private static final int ERRNO_EOPNOTSUPP = -95;
 	
 	private static final int NOTIFICATION_ID = 100;
 
@@ -561,7 +562,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 				else {
 					System.err.println("Unsupported endpoint type: "+selectedEndpoint.getType());
 					context.activeMessages.remove(msg);
-					server.killClient(s);
+					sendReply(s, reply, ERRNO_EOPNOTSUPP);
 				}
 			}
 		});
@@ -768,6 +769,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 				System.err.println("Failed to set default configuration; transfers may fail until client sends SET_CONFIGURATION.");
 			}
 
+			populateDefaultActiveInterfaces(context);
 			populateActiveEndpointMap(context);
 			claimActiveConfigurationInterfaces(context);
 		}
@@ -806,9 +808,11 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 		// Signal queue death
 		context.requestPool.shutdownNow();
 		
-		// Release our claim to the interfaces
-		for (int i = 0; i < context.device.getInterfaceCount(); i++) {
-			context.devConn.releaseInterface(context.device.getInterface(i));
+		// Release our claim to the active interfaces
+		if (context.activeInterfacesById != null) {
+			for (int i = 0; i < context.activeInterfacesById.size(); i++) {
+				context.devConn.releaseInterface(context.activeInterfacesById.valueAt(i));
+			}
 		}
 
 		// Close the connection
@@ -824,12 +828,12 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 
 	private void populateActiveEndpointMap(AttachedDeviceContext context) {
 		context.activeConfigurationEndpointsByNumDir = new SparseArray<>();
-		if (context.activeConfiguration == null) {
+		if (context.activeInterfacesById == null) {
 			return;
 		}
 
-		for (int i = 0; i < context.activeConfiguration.getInterfaceCount(); i++) {
-			UsbInterface iface = context.activeConfiguration.getInterface(i);
+		for (int i = 0; i < context.activeInterfacesById.size(); i++) {
+			UsbInterface iface = context.activeInterfacesById.valueAt(i);
 			for (int j = 0; j < iface.getEndpointCount(); j++) {
 				UsbEndpoint endpoint = iface.getEndpoint(j);
 				context.activeConfigurationEndpointsByNumDir.put(
@@ -840,14 +844,35 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 	}
 
 	private void claimActiveConfigurationInterfaces(AttachedDeviceContext context) {
+		if (context.activeInterfacesById == null) {
+			return;
+		}
+
+		for (int i = 0; i < context.activeInterfacesById.size(); i++) {
+			UsbInterface iface = context.activeInterfacesById.valueAt(i);
+			if (!context.devConn.claimInterface(iface, true)) {
+				System.err.println("Unable to claim interface: " + iface.getId() + "; endpoint traffic on this interface may fail.");
+			}
+		}
+	}
+
+	private void populateDefaultActiveInterfaces(AttachedDeviceContext context) {
+		context.activeInterfacesById = new SparseArray<>();
 		if (context.activeConfiguration == null) {
 			return;
 		}
 
 		for (int i = 0; i < context.activeConfiguration.getInterfaceCount(); i++) {
 			UsbInterface iface = context.activeConfiguration.getInterface(i);
-			if (!context.devConn.claimInterface(iface, true)) {
-				System.err.println("Unable to claim interface: " + iface.getId() + "; endpoint traffic on this interface may fail.");
+			if (iface.getAlternateSetting() == 0 && context.activeInterfacesById.get(iface.getId()) == null) {
+				context.activeInterfacesById.put(iface.getId(), iface);
+			}
+		}
+
+		for (int i = 0; i < context.activeConfiguration.getInterfaceCount(); i++) {
+			UsbInterface iface = context.activeConfiguration.getInterface(i);
+			if (context.activeInterfacesById.get(iface.getId()) == null) {
+				context.activeInterfacesById.put(iface.getId(), iface);
 			}
 		}
 	}

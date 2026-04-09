@@ -290,6 +290,7 @@ The NDK build produces shared libraries for all ABIs (`armeabi-v7a`, `arm64-v8a`
 
 **Transfer errors / device not responding**
 - Some USB devices use isochronous endpoints which are not currently supported.
+- Isochronous URBs are now rejected with a protocol error instead of dropping the whole TCP session, so other devices/endpoints can keep working.
 - Try a shorter OTG cable; signal quality matters at USB 2.0 speeds.
 
 **`usbip attach` fails on Windows**

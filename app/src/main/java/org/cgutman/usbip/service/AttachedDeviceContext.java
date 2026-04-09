@@ -4,6 +4,7 @@ import android.hardware.usb.UsbConfiguration;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
 import android.util.SparseArray;
 
 import org.cgutman.usbip.server.protocol.dev.UsbIpSubmitUrb;
@@ -15,6 +16,7 @@ public class AttachedDeviceContext {
     public UsbDevice device;
     public UsbDeviceConnection devConn;
     public UsbConfiguration activeConfiguration;
+    public SparseArray<UsbInterface> activeInterfacesById;
     public SparseArray<UsbEndpoint> activeConfigurationEndpointsByNumDir;
     public ThreadPoolExecutor requestPool;
     public Set<UsbIpSubmitUrb> activeMessages;
