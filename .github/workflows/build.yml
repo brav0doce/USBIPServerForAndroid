@@ -101,6 +101,7 @@ jobs:
         run: |
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$HAS_KEYSTORE" != "true" ]; then
             echo "A keystore is required for stable tag releases to avoid publishing a non-installable APK."
+            echo "Please configure GitHub secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD."
             exit 1
           fi
 
@@ -115,7 +116,7 @@ jobs:
             -keyalg RSA \
             -keysize 2048 \
             -validity 3650 \
-            -dname "CN=CI Release, OU=Automation, O=USBIPServerForAndroid, L=Remote, ST=Remote, C=US"
+            -dname "CN=CI Release, OU=Automation, O=USBIPServerForAndroid, L=Unknown, ST=Unknown, C=US"
 
       - name: Sign APK
         env:
