@@ -289,7 +289,7 @@ The NDK build produces shared libraries for all ABIs (`armeabi-v7a`, `arm64-v8a`
 - Check that Android granted USB permission (dialog should have appeared).
 
 **Transfer errors / device not responding**
-- Some USB devices use isochronous endpoints which are not currently supported.
+- Isochronous endpoint forwarding is implemented via native `usbdevfs` URBs, but behavior still depends on Android kernel/USB stack quality and client driver support.
 - Try a shorter OTG cable; signal quality matters at USB 2.0 speeds.
 
 **`usbip attach` fails on Windows**

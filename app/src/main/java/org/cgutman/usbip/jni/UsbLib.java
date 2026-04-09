@@ -9,4 +9,7 @@ public class UsbLib {
 											   short index, byte[] data, int length, int timeout);
 
 	public static native int doBulkTransfer(int fd, int endpoint, byte[] data, int timeout);
+
+	public static native int[] doIsoTransfer(int fd, int endpoint, byte[] data, int timeout,
+											 int[] packetLengths, int[] packetActualLengths, int[] packetStatuses);
 }

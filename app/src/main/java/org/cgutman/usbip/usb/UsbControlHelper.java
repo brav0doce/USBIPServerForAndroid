@@ -31,6 +31,77 @@ public class UsbControlHelper {
 	
 	private static final int DEVICE_DESCRIPTOR_TYPE = 1;
 
+	/**
+	 * Initializes the active interface map by selecting one alternate setting per interface
+	 * (preferably alternate setting 0) from the current active configuration.
+	 */
+	public static void populateDefaultActiveInterfaces(AttachedDeviceContext deviceContext) {
+		deviceContext.activeInterfacesById = new SparseArray<>();
+		if (deviceContext.activeConfiguration == null) {
+			return;
+		}
+
+		for (int i = 0; i < deviceContext.activeConfiguration.getInterfaceCount(); i++) {
+			UsbInterface iface = deviceContext.activeConfiguration.getInterface(i);
+			UsbInterface activeIface = deviceContext.activeInterfacesById.get(iface.getId());
+			// Prefer alternate setting 0 when present, but keep a non-zero fallback when it is the only option.
+			if (activeIface == null ||
+					(activeIface.getAlternateSetting() != 0 && iface.getAlternateSetting() == 0)) {
+				deviceContext.activeInterfacesById.put(iface.getId(), iface);
+			}
+		}
+	}
+
+	/**
+	 * Rebuilds the endpoint cache from the currently active interface alternates.
+	 */
+	private static void populateActiveEndpointMap(AttachedDeviceContext deviceContext) {
+		deviceContext.activeConfigurationEndpointsByNumDir = new SparseArray<>();
+		if (deviceContext.activeInterfacesById == null) {
+			return;
+		}
+
+		for (int i = 0; i < deviceContext.activeInterfacesById.size(); i++) {
+			UsbInterface iface = deviceContext.activeInterfacesById.valueAt(i);
+			for (int j = 0; j < iface.getEndpointCount(); j++) {
+				UsbEndpoint endp = iface.getEndpoint(j);
+				deviceContext.activeConfigurationEndpointsByNumDir.put(
+						endp.getDirection() | endp.getEndpointNumber(),
+						endp);
+			}
+		}
+	}
+
+	/**
+	 * Releases all currently active interfaces tracked in the context.
+	 */
+	private static void releaseActiveInterfaces(AttachedDeviceContext deviceContext) {
+		if (deviceContext.activeInterfacesById == null) {
+			return;
+		}
+
+		for (int i = 0; i < deviceContext.activeInterfacesById.size(); i++) {
+			UsbInterface iface = deviceContext.activeInterfacesById.valueAt(i);
+			deviceContext.devConn.releaseInterface(iface);
+		}
+	}
+
+	/**
+	 * Claims all currently active interfaces tracked in the context.
+	 */
+	private static void claimActiveInterfaces(AttachedDeviceContext deviceContext) {
+		if (deviceContext.activeInterfacesById == null) {
+			return;
+		}
+
+		for (int i = 0; i < deviceContext.activeInterfacesById.size(); i++) {
+			UsbInterface iface = deviceContext.activeInterfacesById.valueAt(i);
+			if (!deviceContext.devConn.claimInterface(iface, true)) {
+				System.err.println("Unable to claim interface: " + iface.getId());
+			}
+		}
+	}
+
 	public static UsbDeviceDescriptor readDeviceDescriptor(UsbDeviceConnection devConn) {
 		byte[] descriptorBuffer = new byte[UsbDeviceDescriptor.DESCRIPTOR_SIZE];
 		
@@ -91,10 +162,7 @@ public class UsbControlHelper {
 					// configuration change to work properly.
 					if (deviceContext.activeConfiguration != null) {
 						System.out.println("Unclaiming all interfaces from old configuration: "+deviceContext.activeConfiguration.getId());
-						for (int j = 0; j < deviceContext.activeConfiguration.getInterfaceCount(); j++) {
-							UsbInterface iface = deviceContext.activeConfiguration.getInterface(j);
-							deviceContext.devConn.releaseInterface(iface);
-						}
+						releaseActiveInterfaces(deviceContext);
 					}
 
 					if (!deviceContext.devConn.setConfiguration(config)) {
@@ -107,25 +175,11 @@ public class UsbControlHelper {
 					// This is now the active configuration
 					deviceContext.activeConfiguration = config;
 
-					// Construct the cache of endpoint mappings
-					deviceContext.activeConfigurationEndpointsByNumDir = new SparseArray<>();
-					for (int j = 0; j < deviceContext.activeConfiguration.getInterfaceCount(); j++) {
-						UsbInterface iface = deviceContext.activeConfiguration.getInterface(j);
-						for (int k = 0; k < iface.getEndpointCount(); k++) {
-							UsbEndpoint endp = iface.getEndpoint(k);
-							deviceContext.activeConfigurationEndpointsByNumDir.put(
-									endp.getDirection() | endp.getEndpointNumber(),
-									endp);
-						}
-					}
+					populateDefaultActiveInterfaces(deviceContext);
+					populateActiveEndpointMap(deviceContext);
 
 					System.out.println("Claiming all interfaces from new configuration: "+deviceContext.activeConfiguration.getId());
-					for (int j = 0; j < deviceContext.activeConfiguration.getInterfaceCount(); j++) {
-						UsbInterface iface = deviceContext.activeConfiguration.getInterface(j);
-						if (!deviceContext.devConn.claimInterface(iface, true)) {
-							System.err.println("Unable to claim interface: "+iface.getId());
-						}
-					}
+					claimActiveInterfaces(deviceContext);
 
 					return true;
 				}
@@ -143,6 +197,20 @@ public class UsbControlHelper {
 						if (!deviceContext.devConn.setInterface(iface)) {
 							System.err.println("Unable to set interface: "+iface.getId());
 						}
+
+						if (deviceContext.activeInterfacesById == null) {
+							deviceContext.activeInterfacesById = new SparseArray<>();
+						}
+						UsbInterface previousIface = deviceContext.activeInterfacesById.get(index);
+						if (previousIface != null && previousIface != iface) {
+							deviceContext.devConn.releaseInterface(previousIface);
+						}
+
+						deviceContext.activeInterfacesById.put(index, iface);
+						if (!deviceContext.devConn.claimInterface(iface, true)) {
+							System.err.println("Unable to claim interface: "+iface.getId());
+						}
+						populateActiveEndpointMap(deviceContext);
 						return true;
 					}
 				}

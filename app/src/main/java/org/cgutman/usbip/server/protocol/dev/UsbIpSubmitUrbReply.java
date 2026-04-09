@@ -11,6 +11,7 @@ public class UsbIpSubmitUrbReply extends UsbIpDevicePacket {
 	public int errorCount;
 	
 	public byte[] inData;
+	public UsbIpIsoPacketDescriptor[] isoPacketDescriptors;
 	
 	public UsbIpSubmitUrbReply(int seqNum, int devId, int dir, int ep) {
 		super(UsbIpDevicePacket.USBIP_RET_SUBMIT, seqNum, devId, dir, ep);
@@ -18,8 +19,9 @@ public class UsbIpSubmitUrbReply extends UsbIpDevicePacket {
 
 	protected byte[] serializeInternal() {
 		int inDataLen = inData == null ? 0 : actualLength;
+		byte[] isoPacketData = UsbIpIsoPacketDescriptor.serializeList(isoPacketDescriptors);
 		ByteBuffer bb = ByteBuffer.allocate((UsbIpDevicePacket.USBIP_HEADER_SIZE - 20) +
-				inDataLen).order(ByteOrder.BIG_ENDIAN);
+				inDataLen + isoPacketData.length).order(ByteOrder.BIG_ENDIAN);
 		
 		bb.putInt(status);
 		bb.putInt(actualLength);
@@ -31,6 +33,9 @@ public class UsbIpSubmitUrbReply extends UsbIpDevicePacket {
 		
 		if (inDataLen != 0) {
 			bb.put(inData, 0, inDataLen);
+		}
+		if (isoPacketData.length != 0) {
+			bb.put(isoPacketData);
 		}
 		
 		return bb.array();
