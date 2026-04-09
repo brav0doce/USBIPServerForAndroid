@@ -139,14 +139,17 @@ jobs:
             SIGNING_KEY_PASS="android"
           fi
 
-          export SIGNING_KS_PASS
-          export SIGNING_KS_ALIAS
-          export SIGNING_KEY_PASS
+          SIGNING_KS_PASS_FILE="$(mktemp)"
+          SIGNING_KEY_PASS_FILE="$(mktemp)"
+          chmod 600 "$SIGNING_KS_PASS_FILE" "$SIGNING_KEY_PASS_FILE"
+          printf '%s' "$SIGNING_KS_PASS" > "$SIGNING_KS_PASS_FILE"
+          printf '%s' "$SIGNING_KEY_PASS" > "$SIGNING_KEY_PASS_FILE"
+          trap 'rm -f "$SIGNING_KS_PASS_FILE" "$SIGNING_KEY_PASS_FILE"' EXIT
 
           $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/apksigner sign \
             --ks /tmp/release.jks \
-            --ks-pass env:SIGNING_KS_PASS \
-            --key-pass env:SIGNING_KEY_PASS \
+            --ks-pass file:"$SIGNING_KS_PASS_FILE" \
+            --key-pass file:"$SIGNING_KEY_PASS_FILE" \
             --ks-key-alias "$SIGNING_KS_ALIAS" \
             --out app/build/outputs/apk/release/app-release.apk \
             "$RELEASE_APK_INPUT"
