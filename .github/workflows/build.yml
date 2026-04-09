@@ -73,6 +73,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Set release parameters
+        shell: bash
         run: |
           if [[ "$GITHUB_REF" == "refs/tags/"* ]]; then
             echo "TAG_NAME=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
@@ -101,6 +102,7 @@ jobs:
           fi
 
       - name: Validate signing requirements
+        shell: bash
         run: |
           if [[ "$GITHUB_REF" == "refs/tags/"* && "$HAS_KEYSTORE" != "true" ]]; then
             echo "A keystore is required for stable tag releases to avoid publishing an uninstallable APK."
@@ -122,6 +124,7 @@ jobs:
             -dname "CN=CI Release, OU=Automation, O=USBIPServerForAndroid, L=Unknown, ST=Unknown, C=US"
 
       - name: Sign APK
+        shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}

@@ -225,7 +225,7 @@ To install outside of the Play Store you need a signed APK.
 
    Output: `app/build/outputs/apk/release/app-release.apk`
 
-> Automated release builds are also produced by the GitHub Actions workflow defined in `.github/workflows/build.yml`. Published APKs are always signed, so they are installable on-device.
+> Automated release builds are also produced by the GitHub Actions workflow defined in `.github/workflows/build.yml`. Published APKs are always signed (stable tags with your configured release keystore; pre-releases with a temporary CI keystore), so they are installable on-device.
 
 ---
 
