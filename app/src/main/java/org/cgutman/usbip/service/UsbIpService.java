@@ -730,7 +730,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 			}
 			else {
 				// The buffer came in with the request
-				buff = ByteBuffer.wrap(msg.outData);
+				buff = ByteBuffer.wrap(msg.outData != null ? msg.outData : new byte[0]);
 			}
 			
 			// This message is now active
