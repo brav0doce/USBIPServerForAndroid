@@ -127,20 +127,24 @@ jobs:
         run: |
           if [ "$HAS_KEYSTORE" = "true" ]; then
             echo "$KEYSTORE_BASE64" | base64 --decode > /tmp/release.jks
-            KS_PASS="$KEYSTORE_PASSWORD"
-            KS_ALIAS="$KEY_ALIAS"
-            KEY_PASS="$KEY_PASSWORD"
+            SIGNING_KS_PASS="$KEYSTORE_PASSWORD"
+            SIGNING_KS_ALIAS="$KEY_ALIAS"
+            SIGNING_KEY_PASS="$KEY_PASSWORD"
           else
-            KS_PASS="android"
-            KS_ALIAS="ci-release"
-            KEY_PASS="android"
+            SIGNING_KS_PASS="android"
+            SIGNING_KS_ALIAS="ci-release"
+            SIGNING_KEY_PASS="android"
           fi
+
+          echo "SIGNING_KS_PASS=$SIGNING_KS_PASS" >> "$GITHUB_ENV"
+          echo "SIGNING_KS_ALIAS=$SIGNING_KS_ALIAS" >> "$GITHUB_ENV"
+          echo "SIGNING_KEY_PASS=$SIGNING_KEY_PASS" >> "$GITHUB_ENV"
 
           $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/apksigner sign \
             --ks /tmp/release.jks \
-            --ks-pass pass:"$KS_PASS" \
-            --key-pass pass:"$KEY_PASS" \
-            --ks-key-alias "$KS_ALIAS" \
+            --ks-pass env:SIGNING_KS_PASS \
+            --key-pass env:SIGNING_KEY_PASS \
+            --ks-key-alias "$SIGNING_KS_ALIAS" \
             --out app/build/outputs/apk/release/app-release.apk \
             "$RELEASE_APK_INPUT"
 
