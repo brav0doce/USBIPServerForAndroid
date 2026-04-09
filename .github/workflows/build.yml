@@ -100,7 +100,7 @@ jobs:
       - name: Validate signing requirements
         run: |
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$HAS_KEYSTORE" != "true" ]; then
-            echo "A keystore is required for stable tag releases to avoid publishing a non-installable APK."
+            echo "A keystore is required for stable tag releases to avoid publishing an uninstallable APK."
             echo "Please configure GitHub secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD."
             exit 1
           fi
