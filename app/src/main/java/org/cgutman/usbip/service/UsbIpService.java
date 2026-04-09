@@ -777,10 +777,10 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 		for (int i = 0; i < dev.getInterfaceCount(); i++) {
 			endpointCount += dev.getInterface(i).getEndpointCount();
 		}
-		int requestThreadCount = endpointCount > 0 ? endpointCount : 1;
+		int threadPoolSize = endpointCount > 0 ? endpointCount : 1;
 		
 		// Use a thread pool with a thread per endpoint
-		context.requestPool = new ThreadPoolExecutor(requestThreadCount, requestThreadCount,
+		context.requestPool = new ThreadPoolExecutor(threadPoolSize, threadPoolSize,
 				Long.MAX_VALUE, TimeUnit.DAYS,
 				new LinkedBlockingQueue<>(), new ThreadPoolExecutor.DiscardPolicy());
 		
