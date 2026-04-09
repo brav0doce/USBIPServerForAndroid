@@ -8,7 +8,7 @@ import android.util.SparseArray;
 
 import org.cgutman.usbip.server.protocol.dev.UsbIpSubmitUrb;
 
-import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ThreadPoolExecutor;
 
 public class AttachedDeviceContext {
@@ -17,5 +17,5 @@ public class AttachedDeviceContext {
     public UsbConfiguration activeConfiguration;
     public SparseArray<UsbEndpoint> activeConfigurationEndpointsByNumDir;
     public ThreadPoolExecutor requestPool;
-    public HashSet<UsbIpSubmitUrb> activeMessages;
+    public Set<UsbIpSubmitUrb> activeMessages;
 }

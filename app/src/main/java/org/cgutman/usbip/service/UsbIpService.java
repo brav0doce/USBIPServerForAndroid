@@ -5,8 +5,8 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -67,6 +67,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 	private WifiLock lowLatencyWifiLock;
 	
 	private static final boolean DEBUG = false;
+	private static final int MAX_URB_TRANSFER_BUFFER_LENGTH = 16 * 1024 * 1024;
 	
 	private static final int NOTIFICATION_ID = 100;
 
@@ -350,7 +351,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 		ipDev.bDeviceSubClass = (byte) dev.getDeviceSubclass();
 		ipDev.bDeviceProtocol = (byte) dev.getDeviceProtocol();
 
-		ipDev.bConfigurationValue = 0;
+		ipDev.bConfigurationValue = (byte) (dev.getConfigurationCount() > 0 ? dev.getConfiguration(0).getId() : 0);
 		ipDev.bNumConfigurations = (byte) dev.getConfigurationCount();
 
 		ipDev.bNumInterfaces = (byte) dev.getInterfaceCount();
@@ -570,6 +571,12 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 	public void submitUrbRequest(Socket s, UsbIpSubmitUrb msg) {
 		UsbIpSubmitUrbReply reply = new UsbIpSubmitUrbReply(msg.seqNum,
 				msg.devId, msg.direction, msg.ep);
+
+		if (msg.transferBufferLength < 0 || msg.transferBufferLength > MAX_URB_TRANSFER_BUFFER_LENGTH) {
+			System.err.println("Invalid transfer buffer length: " + msg.transferBufferLength);
+			sendReply(s, reply, ProtoDefs.ST_NA);
+			return;
+		}
 		
 		int deviceId = devIdToDeviceId(msg.devId);
 		
@@ -754,20 +761,31 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 		AttachedDeviceContext context = new AttachedDeviceContext();
 		context.devConn = devConn;
 		context.device = dev;
+		if (dev.getConfigurationCount() > 0) {
+			context.activeConfiguration = dev.getConfiguration(0);
+
+			if (!context.devConn.setConfiguration(context.activeConfiguration)) {
+				System.err.println("Failed to set default configuration; transfers may fail until client sends SET_CONFIGURATION.");
+			}
+
+			populateActiveEndpointMap(context);
+			claimActiveConfigurationInterfaces(context);
+		}
 		
 		// Count all endpoints on all interfaces
 		int endpointCount = 0;
 		for (int i = 0; i < dev.getInterfaceCount(); i++) {
 			endpointCount += dev.getInterface(i).getEndpointCount();
 		}
+		int threadPoolSize = endpointCount > 0 ? endpointCount : 1;
 		
 		// Use a thread pool with a thread per endpoint
-		context.requestPool = new ThreadPoolExecutor(endpointCount, endpointCount,
+		context.requestPool = new ThreadPoolExecutor(threadPoolSize, threadPoolSize,
 				Long.MAX_VALUE, TimeUnit.DAYS,
 				new LinkedBlockingQueue<>(), new ThreadPoolExecutor.DiscardPolicy());
 		
 		// Create the active message set
-		context.activeMessages = new HashSet<>();
+		context.activeMessages = Collections.synchronizedSet(new java.util.HashSet<>());
 		
 		connections.put(dev.getDeviceId(), context);
 		socketMap.put(s, context);
@@ -803,6 +821,36 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 
 		updateNotification();
 	}
+
+	private void populateActiveEndpointMap(AttachedDeviceContext context) {
+		context.activeConfigurationEndpointsByNumDir = new SparseArray<>();
+		if (context.activeConfiguration == null) {
+			return;
+		}
+
+		for (int i = 0; i < context.activeConfiguration.getInterfaceCount(); i++) {
+			UsbInterface iface = context.activeConfiguration.getInterface(i);
+			for (int j = 0; j < iface.getEndpointCount(); j++) {
+				UsbEndpoint endpoint = iface.getEndpoint(j);
+				context.activeConfigurationEndpointsByNumDir.put(
+						endpoint.getDirection() | endpoint.getEndpointNumber(),
+						endpoint);
+			}
+		}
+	}
+
+	private void claimActiveConfigurationInterfaces(AttachedDeviceContext context) {
+		if (context.activeConfiguration == null) {
+			return;
+		}
+
+		for (int i = 0; i < context.activeConfiguration.getInterfaceCount(); i++) {
+			UsbInterface iface = context.activeConfiguration.getInterface(i);
+			if (!context.devConn.claimInterface(iface, true)) {
+				System.err.println("Unable to claim interface: " + iface.getId() + "; endpoint traffic on this interface may fail.");
+			}
+		}
+	}
 	
 	@Override
 	public void detachFromDevice(Socket s, String busId) {
@@ -835,9 +883,11 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 		
 		boolean found = false;
 		synchronized (context.activeMessages) {
-			for (UsbIpSubmitUrb urbMsg : context.activeMessages) {
+			java.util.Iterator<UsbIpSubmitUrb> iterator = context.activeMessages.iterator();
+			while (iterator.hasNext()) {
+				UsbIpSubmitUrb urbMsg = iterator.next();
 				if (msg.seqNumToUnlink == urbMsg.seqNum) {
-					context.activeMessages.remove(urbMsg);
+					iterator.remove();
 					found = true;
 					break;
 				}
