@@ -44,6 +44,7 @@ public class UsbControlHelper {
 		for (int i = 0; i < deviceContext.activeConfiguration.getInterfaceCount(); i++) {
 			UsbInterface iface = deviceContext.activeConfiguration.getInterface(i);
 			UsbInterface activeIface = deviceContext.activeInterfacesById.get(iface.getId());
+			// Prefer alternate setting 0 when present, but keep a non-zero fallback when it is the only option.
 			if (activeIface == null ||
 					(activeIface.getAlternateSetting() != 0 && iface.getAlternateSetting() == 0)) {
 				deviceContext.activeInterfacesById.put(iface.getId(), iface);
@@ -200,9 +201,9 @@ public class UsbControlHelper {
 						if (deviceContext.activeInterfacesById == null) {
 							deviceContext.activeInterfacesById = new SparseArray<>();
 						}
-						UsbInterface currentIface = deviceContext.activeInterfacesById.get(index);
-						if (currentIface != null && currentIface != iface) {
-							deviceContext.devConn.releaseInterface(currentIface);
+						UsbInterface previousIface = deviceContext.activeInterfacesById.get(index);
+						if (previousIface != null && previousIface != iface) {
+							deviceContext.devConn.releaseInterface(previousIface);
 						}
 
 						deviceContext.activeInterfacesById.put(index, iface);
