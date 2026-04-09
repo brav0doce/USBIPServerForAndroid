@@ -765,7 +765,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 			context.activeConfiguration = dev.getConfiguration(0);
 
 			if (!context.devConn.setConfiguration(context.activeConfiguration)) {
-				System.err.println("Failed to set default configuration! Proceeding anyway!");
+				System.err.println("Failed to set default configuration; transfers may fail until client sends SET_CONFIGURATION.");
 			}
 
 			populateActiveEndpointMap(context);
@@ -777,10 +777,10 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 		for (int i = 0; i < dev.getInterfaceCount(); i++) {
 			endpointCount += dev.getInterface(i).getEndpointCount();
 		}
-		endpointCount = Math.max(1, endpointCount);
+		int requestThreadCount = endpointCount > 0 ? endpointCount : 1;
 		
 		// Use a thread pool with a thread per endpoint
-		context.requestPool = new ThreadPoolExecutor(endpointCount, endpointCount,
+		context.requestPool = new ThreadPoolExecutor(requestThreadCount, requestThreadCount,
 				Long.MAX_VALUE, TimeUnit.DAYS,
 				new LinkedBlockingQueue<>(), new ThreadPoolExecutor.DiscardPolicy());
 		
@@ -847,7 +847,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 		for (int i = 0; i < context.activeConfiguration.getInterfaceCount(); i++) {
 			UsbInterface iface = context.activeConfiguration.getInterface(i);
 			if (!context.devConn.claimInterface(iface, true)) {
-				System.err.println("Unable to claim interface: " + iface.getId());
+				System.err.println("Unable to claim interface: " + iface.getId() + "; endpoint traffic on this interface may fail.");
 			}
 		}
 	}
