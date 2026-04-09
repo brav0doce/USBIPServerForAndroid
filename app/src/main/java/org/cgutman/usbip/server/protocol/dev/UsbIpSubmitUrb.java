@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 
 import org.cgutman.usbip.utils.StreamUtils;
 
@@ -14,6 +15,7 @@ public class UsbIpSubmitUrb extends UsbIpDevicePacket {
 	public int numberOfPackets;
 	public int interval;
 	public byte[] setup;
+	public UsbIpIsoPacketDescriptor[] isoPacketDescriptors;
 	
 	public static final int WIRE_SIZE =
 			20 + 8;
@@ -46,9 +48,44 @@ public class UsbIpSubmitUrb extends UsbIpDevicePacket {
 			bb.position(bb.position()+1);
 		}
 		
-		if (msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT) {
-			msg.outData = new byte[msg.transferBufferLength];
-			StreamUtils.readAll(in, msg.outData);
+		int isoDescWireLength = Math.max(msg.numberOfPackets, 0) * UsbIpIsoPacketDescriptor.WIRE_SIZE;
+		int outWireLength = msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT ?
+				Math.max(msg.transferBufferLength, 0) : 0;
+		int variableWireLength = outWireLength + isoDescWireLength;
+		if (variableWireLength > 0) {
+			byte[] variableData = new byte[variableWireLength];
+			StreamUtils.readAll(in, variableData);
+
+			if (outWireLength > 0) {
+				msg.outData = new byte[outWireLength];
+			}
+
+			if (msg.numberOfPackets > 0) {
+				UsbIpIsoPacketDescriptor[] descFirst = UsbIpIsoPacketDescriptor.deserializeList(variableData, 0, msg.numberOfPackets);
+				boolean firstPlausible = UsbIpIsoPacketDescriptor.looksPlausible(descFirst, msg.transferBufferLength);
+
+				UsbIpIsoPacketDescriptor[] descLast = UsbIpIsoPacketDescriptor.deserializeList(
+						variableData, variableData.length - isoDescWireLength, msg.numberOfPackets);
+				boolean lastPlausible = UsbIpIsoPacketDescriptor.looksPlausible(descLast, msg.transferBufferLength);
+
+				if (msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT) {
+					boolean useDescFirst = firstPlausible && !lastPlausible;
+					if (useDescFirst) {
+						msg.isoPacketDescriptors = descFirst;
+						System.arraycopy(variableData, isoDescWireLength, msg.outData, 0, outWireLength);
+					}
+					else {
+						msg.isoPacketDescriptors = descLast;
+						System.arraycopy(variableData, 0, msg.outData, 0, outWireLength);
+					}
+				}
+				else {
+					msg.isoPacketDescriptors = descFirst;
+				}
+			}
+			else if (msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT) {
+				System.arraycopy(variableData, 0, msg.outData, 0, outWireLength);
+			}
 		}
 		
 		return msg;
@@ -61,7 +98,9 @@ public class UsbIpSubmitUrb extends UsbIpDevicePacket {
 				String.format("Xfer length: %d\n", transferBufferLength) +
 				String.format("Start frame: %d\n", startFrame) +
 				String.format("Number Of Packets: %d\n", numberOfPackets) +
-				String.format("Interval: %d\n", interval);
+				String.format("Interval: %d\n", interval) +
+				String.format("Iso descriptors: %s\n",
+						isoPacketDescriptors == null ? "none" : Arrays.toString(isoPacketDescriptors));
 		return sb;
 	}
 

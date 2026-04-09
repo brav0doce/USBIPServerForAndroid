@@ -559,6 +559,56 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 					
 					sendReply(s, reply, reply.status);
 				}
+				else if (selectedEndpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_ISOC) {
+					if (DEBUG) {
+						System.out.printf("Isochronous transfer - %d bytes %s on EP %d (%d packets)\n",
+								msg.transferBufferLength, msg.direction == UsbIpDevicePacket.USBIP_DIR_IN ? "in" : "out",
+								selectedEndpoint.getEndpointNumber(), msg.numberOfPackets);
+					}
+
+					if (msg.isoPacketDescriptors == null || msg.isoPacketDescriptors.length != msg.numberOfPackets) {
+						context.activeMessages.remove(msg);
+						sendReply(s, reply, ProtoDefs.ST_NA);
+						return;
+					}
+
+					XferUtils.IsoTransferResult isoRes;
+					do {
+						isoRes = XferUtils.doIsoTransfer(context.devConn, selectedEndpoint, buff.array(), 1000,
+								msg.isoPacketDescriptors);
+
+						if (context.requestPool.isShutdown()) {
+							return;
+						}
+
+						if (!context.activeMessages.contains(msg)) {
+							return;
+						}
+					} while (isoRes.status == UsbIpDevicePacket.USBIP_STATUS_URB_TIMED_OUT);
+
+					if (!context.activeMessages.remove(msg)) {
+						return;
+					}
+
+					reply.numberOfPackets = msg.numberOfPackets;
+					reply.errorCount = isoRes.errorCount;
+					reply.isoPacketDescriptors = msg.isoPacketDescriptors;
+					if (isoRes.status < 0) {
+						reply.status = isoRes.status;
+
+						UsbDevice dev = getDevice(deviceId);
+						if (dev == null) {
+							server.killClient(s);
+							return;
+						}
+					}
+					else {
+						reply.actualLength = isoRes.actualLength;
+						reply.status = ProtoDefs.ST_OK;
+					}
+
+					sendReply(s, reply, reply.status);
+				}
 				else {
 					System.err.println("Unsupported endpoint type: "+selectedEndpoint.getType());
 					context.activeMessages.remove(msg);
