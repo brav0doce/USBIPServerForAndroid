@@ -7,6 +7,8 @@ import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbEndpoint;
 
 public class XferUtils {
+	private static final int ERRNO_ETIMEDOUT = -110;
+
 	public static class IsoTransferResult {
 		public int status;
 		public int actualLength;
@@ -16,7 +18,7 @@ public class XferUtils {
 	public static int doInterruptTransfer(UsbDeviceConnection devConn, UsbEndpoint endpoint, byte[] buff, int timeout) {
 		// Interrupt transfers are implemented as one-shot bulk transfers
 		int res = UsbLib.doBulkTransfer(devConn.getFileDescriptor(), endpoint.getAddress(), buff, timeout);
-		if (res < 0 && res != -110) {
+		if (res < 0 && res != ERRNO_ETIMEDOUT) {
 			// Don't print for ETIMEDOUT
 			System.err.println("Interrupt Xfer failed: "+res);
 		}
@@ -26,7 +28,7 @@ public class XferUtils {
 	
 	public static int doBulkTransfer(UsbDeviceConnection devConn, UsbEndpoint endpoint, byte[] buff, int timeout) {
 		int res = UsbLib.doBulkTransfer(devConn.getFileDescriptor(), endpoint.getAddress(), buff, timeout);
-		if (res < 0 && res != -110) {
+		if (res < 0 && res != ERRNO_ETIMEDOUT) {
 			// Don't print for ETIMEDOUT
 			System.err.println("Bulk Xfer failed: "+res);
 		}
@@ -62,7 +64,7 @@ public class XferUtils {
 			descriptors[i].status = packetStatuses[i];
 		}
 
-		if (result.status < 0 && result.status != -110) {
+		if (result.status < 0 && result.status != ERRNO_ETIMEDOUT) {
 			System.err.println("Iso Xfer failed: "+result.status);
 		}
 
@@ -84,7 +86,7 @@ public class XferUtils {
 		
 		int res = UsbLib.doControlTransfer(devConn.getFileDescriptor(), (byte)requestType, (byte)request,
 				(short)value, (short)index, buff, length, interval);
-		if (res < 0 && res != -110) {
+		if (res < 0 && res != ERRNO_ETIMEDOUT) {
 			// Don't print for ETIMEDOUT
 			System.err.println("Control Xfer failed: "+res);
 		}

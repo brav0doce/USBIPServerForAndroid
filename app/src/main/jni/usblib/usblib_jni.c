@@ -64,7 +64,7 @@ Java_org_cgutman_usbip_jni_UsbLib_doControlTransfer(
     return res;
 };
 
-static jintArray make_iso_result(JNIEnv *env, jint status, jint actual_length, jint error_count) {
+static jintArray createIsoResultArray(JNIEnv *env, jint status, jint actual_length, jint error_count) {
     jintArray result = (*env)->NewIntArray(env, 3);
     if (result == NULL) {
         return NULL;
@@ -86,14 +86,14 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
     (void)clazz;
 
     if (packet_lengths == NULL || packet_actual_lengths == NULL || packet_statuses == NULL) {
-        return make_iso_result(env, -EINVAL, 0, 0);
+        return createIsoResultArray(env, -EINVAL, 0, 0);
     }
 
     jsize packet_count = (*env)->GetArrayLength(env, packet_lengths);
     if (packet_count <= 0 ||
             packet_count != (*env)->GetArrayLength(env, packet_actual_lengths) ||
             packet_count != (*env)->GetArrayLength(env, packet_statuses)) {
-        return make_iso_result(env, -EINVAL, 0, 0);
+        return createIsoResultArray(env, -EINVAL, 0, 0);
     }
 
     jsize data_len = data ? (*env)->GetArrayLength(env, data) : 0;
@@ -115,7 +115,7 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
         if (packet_statuses_ptr) {
             (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
         }
-        return make_iso_result(env, -ENOMEM, 0, 0);
+        return createIsoResultArray(env, -ENOMEM, 0, 0);
     }
 
     struct usbdevfs_urb *urb = calloc(1, sizeof(struct usbdevfs_urb) +
@@ -127,7 +127,7 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
         (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
         (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
         (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-        return make_iso_result(env, -ENOMEM, 0, 0);
+        return createIsoResultArray(env, -ENOMEM, 0, 0);
     }
 
     int total_requested_length = 0;
@@ -140,7 +140,7 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
             (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
             (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
             (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-            return make_iso_result(env, -EINVAL, 0, 0);
+            return createIsoResultArray(env, -EINVAL, 0, 0);
         }
 
         urb->iso_frame_desc[i].length = (unsigned int)packet_lengths_ptr[i];
@@ -155,7 +155,7 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
         (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
         (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
         (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-        return make_iso_result(env, -EINVAL, 0, 0);
+        return createIsoResultArray(env, -EINVAL, 0, 0);
     }
 
     urb->type = USBDEVFS_URB_TYPE_ISO;
@@ -175,7 +175,7 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
         (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
         (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
         (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-        return make_iso_result(env, res, 0, 0);
+        return createIsoResultArray(env, res, 0, 0);
     }
 
     struct usbdevfs_urb *reaped_urb = NULL;
@@ -240,5 +240,5 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
     (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, 0);
     (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, 0);
 
-    return make_iso_result(env, transfer_status, transfer_actual_length, transfer_error_count);
+    return createIsoResultArray(env, transfer_status, transfer_actual_length, transfer_error_count);
 }

@@ -128,4 +128,15 @@ public class UsbIpIsoProtocolTest {
 		assertEquals(4, descriptors[1].offset);
 		assertEquals(4, descriptors[1].actualLength);
 	}
+
+	@Test
+	public void isoDescriptorToStringIncludesFields() {
+		UsbIpIsoPacketDescriptor descriptor = new UsbIpIsoPacketDescriptor();
+		descriptor.offset = 16;
+		descriptor.length = 192;
+		descriptor.actualLength = 128;
+		descriptor.status = -32;
+
+		assertEquals("{off=16 len=192 actual=128 status=-32}", descriptor.toString());
+	}
 }
