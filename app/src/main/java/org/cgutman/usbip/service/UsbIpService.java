@@ -769,7 +769,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 				System.err.println("Failed to set default configuration; transfers may fail until client sends SET_CONFIGURATION.");
 			}
 
-			populateDefaultActiveInterfaces(context);
+			UsbControlHelper.populateDefaultActiveInterfaces(context);
 			populateActiveEndpointMap(context);
 			claimActiveConfigurationInterfaces(context);
 		}
@@ -856,27 +856,6 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 		}
 	}
 
-	private void populateDefaultActiveInterfaces(AttachedDeviceContext context) {
-		context.activeInterfacesById = new SparseArray<>();
-		if (context.activeConfiguration == null) {
-			return;
-		}
-
-		for (int i = 0; i < context.activeConfiguration.getInterfaceCount(); i++) {
-			UsbInterface iface = context.activeConfiguration.getInterface(i);
-			if (iface.getAlternateSetting() == 0 && context.activeInterfacesById.get(iface.getId()) == null) {
-				context.activeInterfacesById.put(iface.getId(), iface);
-			}
-		}
-
-		for (int i = 0; i < context.activeConfiguration.getInterfaceCount(); i++) {
-			UsbInterface iface = context.activeConfiguration.getInterface(i);
-			if (context.activeInterfacesById.get(iface.getId()) == null) {
-				context.activeInterfacesById.put(iface.getId(), iface);
-			}
-		}
-	}
-	
 	@Override
 	public void detachFromDevice(Socket s, String busId) {
 		UsbDevice dev = getDevice(busId);

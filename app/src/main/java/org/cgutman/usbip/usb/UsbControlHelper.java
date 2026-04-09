@@ -31,7 +31,7 @@ public class UsbControlHelper {
 	
 	private static final int DEVICE_DESCRIPTOR_TYPE = 1;
 
-	private static void populateDefaultActiveInterfaces(AttachedDeviceContext deviceContext) {
+	public static void populateDefaultActiveInterfaces(AttachedDeviceContext deviceContext) {
 		deviceContext.activeInterfacesById = new SparseArray<>();
 		if (deviceContext.activeConfiguration == null) {
 			return;
@@ -39,14 +39,9 @@ public class UsbControlHelper {
 
 		for (int i = 0; i < deviceContext.activeConfiguration.getInterfaceCount(); i++) {
 			UsbInterface iface = deviceContext.activeConfiguration.getInterface(i);
-			if (iface.getAlternateSetting() == 0 && deviceContext.activeInterfacesById.get(iface.getId()) == null) {
-				deviceContext.activeInterfacesById.put(iface.getId(), iface);
-			}
-		}
-
-		for (int i = 0; i < deviceContext.activeConfiguration.getInterfaceCount(); i++) {
-			UsbInterface iface = deviceContext.activeConfiguration.getInterface(i);
-			if (deviceContext.activeInterfacesById.get(iface.getId()) == null) {
+			UsbInterface activeIface = deviceContext.activeInterfacesById.get(iface.getId());
+			if (activeIface == null ||
+					(activeIface.getAlternateSetting() != 0 && iface.getAlternateSetting() == 0)) {
 				deviceContext.activeInterfacesById.put(iface.getId(), iface);
 			}
 		}
