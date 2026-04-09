@@ -55,14 +55,14 @@ public class UsbIpSubmitUrb extends UsbIpDevicePacket {
 		int isoDescWireLength = msg.numberOfPackets * UsbIpIsoPacketDescriptor.WIRE_SIZE;
 		int outWireLength = msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT ?
 				msg.transferBufferLength : 0;
+		if (msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT) {
+			// Keep legacy behavior: always provide a non-null payload for OUT URBs, including zero-length ones.
+			msg.outData = new byte[outWireLength];
+		}
 		int variableWireLength = outWireLength + isoDescWireLength;
 		if (variableWireLength > 0) {
 			byte[] variableData = new byte[variableWireLength];
 			StreamUtils.readAll(in, variableData);
-
-			if (outWireLength > 0) {
-				msg.outData = new byte[outWireLength];
-			}
 
 			if (msg.numberOfPackets > 0) {
 				UsbIpIsoPacketDescriptor[] descFirst = UsbIpIsoPacketDescriptor.deserializeList(variableData, 0, msg.numberOfPackets);
