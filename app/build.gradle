@@ -4,14 +4,14 @@ android {
     ndkVersion "27.0.12077973"
 
     namespace "org.cgutman.usbipserverforandroid"
-    compileSdk 34
+    compileSdk 35
 
     defaultConfig {
         applicationId "org.cgutman.usbipserverforandroid"
         minSdk 21
-        targetSdk 34
-        versionCode 3
-        versionName "0.1"
+        targetSdk 35
+        versionCode 4
+        versionName "0.2.0"
 
         ndk {
             abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
@@ -33,8 +33,8 @@ android {
 }
 
 dependencies {
-    implementation 'androidx.core:core:1.13.1'
-    implementation 'androidx.activity:activity:1.9.1'
+    implementation 'androidx.core:core:1.15.0'
+    implementation 'androidx.activity:activity:1.10.1'
 }
 
 configurations.implementation {

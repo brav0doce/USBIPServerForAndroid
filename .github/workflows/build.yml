@@ -97,20 +97,49 @@ jobs:
             exit 1
           fi
 
+      - name: Validate signing requirements
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$HAS_KEYSTORE" != "true" ]; then
+            echo "A keystore is required for stable tag releases to avoid publishing a non-installable APK."
+            exit 1
+          fi
+
+      - name: Create temporary keystore for pre-release signing
+        if: ${{ env.HAS_KEYSTORE != 'true' }}
+        run: |
+          keytool -genkeypair -v \
+            -keystore /tmp/release.jks \
+            -storepass android \
+            -alias ci-release \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 3650 \
+            -dname "CN=CI Release, OU=Automation, O=USBIPServerForAndroid, L=Remote, ST=Remote, C=US"
+
       - name: Sign APK
-        if: ${{ env.HAS_KEYSTORE == 'true' }}
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "$KEYSTORE_BASE64" | base64 --decode > /tmp/release.jks
+          if [ "$HAS_KEYSTORE" = "true" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > /tmp/release.jks
+            KS_PASS="$KEYSTORE_PASSWORD"
+            KS_ALIAS="$KEY_ALIAS"
+            KEY_PASS="$KEY_PASSWORD"
+          else
+            KS_PASS="android"
+            KS_ALIAS="ci-release"
+            KEY_PASS="android"
+          fi
+
           $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/apksigner sign \
             --ks /tmp/release.jks \
-            --ks-pass env:KEYSTORE_PASSWORD \
-            --key-pass env:KEY_PASSWORD \
-            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass pass:"$KS_PASS" \
+            --key-pass pass:"$KEY_PASS" \
+            --ks-key-alias "$KS_ALIAS" \
             --out app/build/outputs/apk/release/app-release.apk \
             "$RELEASE_APK_INPUT"
 
