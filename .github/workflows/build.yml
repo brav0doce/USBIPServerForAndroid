@@ -26,7 +26,7 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install NDK
         run: sdkmanager "ndk;27.0.12077973"
@@ -41,7 +41,7 @@ jobs:
         run: ./gradlew assembleRelease --no-daemon
 
       - name: Upload debug APK artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/app-debug.apk
@@ -49,7 +49,7 @@ jobs:
           retention-days: 30
 
       - name: Upload release APK artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: app-release
           path: app/build/outputs/apk/release/app-release*.apk
@@ -68,7 +68,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Download release APK artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           name: app-release
           path: app/build/outputs/apk/release/
@@ -86,7 +86,7 @@ jobs:
           fi
 
       - name: Sign APK
-        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
