@@ -74,7 +74,7 @@ jobs:
 
       - name: Set release parameters
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ "$GITHUB_REF" == "refs/tags/"* ]]; then
             echo "TAG_NAME=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
             echo "PRERELEASE=false" >> "$GITHUB_ENV"
           else
@@ -102,7 +102,7 @@ jobs:
 
       - name: Validate signing requirements
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* && "$HAS_KEYSTORE" != "true" ]]; then
+          if [[ "$GITHUB_REF" == "refs/tags/"* && "$HAS_KEYSTORE" != "true" ]]; then
             echo "A keystore is required for stable tag releases to avoid publishing an uninstallable APK."
             echo "Please configure GitHub secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD."
             exit 1
@@ -139,6 +139,7 @@ jobs:
             SIGNING_KEY_PASS="android"
           fi
 
+          umask 077
           SIGNING_KS_PASS_FILE="$(mktemp)"
           SIGNING_KEY_PASS_FILE="$(mktemp)"
           chmod 600 "$SIGNING_KS_PASS_FILE" "$SIGNING_KEY_PASS_FILE"
