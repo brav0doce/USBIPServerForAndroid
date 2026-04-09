@@ -74,7 +74,7 @@ jobs:
 
       - name: Set release parameters
         run: |
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             echo "TAG_NAME=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
             echo "PRERELEASE=false" >> "$GITHUB_ENV"
           else
@@ -102,14 +102,14 @@ jobs:
 
       - name: Validate signing requirements
         run: |
-          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$HAS_KEYSTORE" != "true" ]; then
+          if [[ "$GITHUB_REF" == refs/tags/* ]] && [ "$HAS_KEYSTORE" != "true" ]; then
             echo "A keystore is required for stable tag releases to avoid publishing an uninstallable APK."
             echo "Please configure GitHub secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD."
             exit 1
           fi
 
       - name: Create temporary keystore for pre-release signing
-        if: ${{ env.HAS_KEYSTORE != 'true' }}
+        if: env.HAS_KEYSTORE != 'true'
         run: |
           keytool -genkeypair -v \
             -keystore /tmp/release.jks \
@@ -139,9 +139,9 @@ jobs:
             SIGNING_KEY_PASS="android"
           fi
 
-          echo "SIGNING_KS_PASS=$SIGNING_KS_PASS" >> "$GITHUB_ENV"
-          echo "SIGNING_KS_ALIAS=$SIGNING_KS_ALIAS" >> "$GITHUB_ENV"
-          echo "SIGNING_KEY_PASS=$SIGNING_KEY_PASS" >> "$GITHUB_ENV"
+          export SIGNING_KS_PASS
+          export SIGNING_KS_ALIAS
+          export SIGNING_KEY_PASS
 
           $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/apksigner sign \
             --ks /tmp/release.jks \
