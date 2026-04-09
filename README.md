@@ -146,9 +146,9 @@ sudo usbip detach -p 0
 |------|-------------------|
 | Android Studio | Ladybug (2024.2) or newer |
 | JDK | 17 |
-| Android SDK | API 34 (compile & target) |
+| Android SDK | API 35 (compile & target) |
 | Android NDK | 27.0.12077973 |
-| Gradle | 8.7 (wrapper included) |
+| Gradle | 8.9 (wrapper included) |
 
 > **NDK note:** The app contains native C code (`usblib_jni.c`) compiled via `ndk-build`. The NDK version is pinned in `app/build.gradle` (`ndkVersion`). Android Studio will prompt you to install it automatically.
 
@@ -225,7 +225,7 @@ To install outside of the Play Store you need a signed APK.
 
    Output: `app/build/outputs/apk/release/app-release.apk`
 
-> Automated release builds are also produced by the GitHub Actions workflow defined in `.github/workflows/build.yml`.
+> Automated release builds are also produced by the GitHub Actions workflow defined in `.github/workflows/build.yml`. Published APKs are always signed (stable tags with your configured release keystore; pre-releases with a temporary CI keystore), so they are installable on-device.
 
 ---
 
@@ -301,4 +301,3 @@ The NDK build produces shared libraries for all ABIs (`armeabi-v7a`, `arm64-v8a`
 ## License
 
 See [LICENSE](LICENSE).
-
