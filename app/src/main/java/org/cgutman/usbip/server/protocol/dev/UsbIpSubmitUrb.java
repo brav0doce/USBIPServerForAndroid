@@ -47,10 +47,14 @@ public class UsbIpSubmitUrb extends UsbIpDevicePacket {
 			in.read();
 			bb.position(bb.position()+1);
 		}
+
+		if (msg.transferBufferLength < 0 || msg.numberOfPackets < 0) {
+			throw new IOException("Invalid USB/IP submit lengths");
+		}
 		
-		int isoDescWireLength = Math.max(msg.numberOfPackets, 0) * UsbIpIsoPacketDescriptor.WIRE_SIZE;
+		int isoDescWireLength = msg.numberOfPackets * UsbIpIsoPacketDescriptor.WIRE_SIZE;
 		int outWireLength = msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT ?
-				Math.max(msg.transferBufferLength, 0) : 0;
+				msg.transferBufferLength : 0;
 		int variableWireLength = outWireLength + isoDescWireLength;
 		if (variableWireLength > 0) {
 			byte[] variableData = new byte[variableWireLength];
@@ -69,6 +73,8 @@ public class UsbIpSubmitUrb extends UsbIpDevicePacket {
 				boolean lastPlausible = UsbIpIsoPacketDescriptor.looksPlausible(descLast, msg.transferBufferLength);
 
 				if (msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT) {
+					// Prefer the unique plausible layout. If both or neither look plausible, fall back
+					// to descriptors-after-data because that is what Linux USB/IP implementations emit.
 					boolean useDescFirst = firstPlausible && !lastPlausible;
 					if (useDescFirst) {
 						msg.isoPacketDescriptors = descFirst;
