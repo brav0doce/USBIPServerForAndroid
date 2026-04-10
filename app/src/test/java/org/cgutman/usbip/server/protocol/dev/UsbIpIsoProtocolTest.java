@@ -3,12 +3,14 @@ package org.cgutman.usbip.server.protocol.dev;
 import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.fail;
 
 public class UsbIpIsoProtocolTest {
 	private static byte[] buildSubmitPacket(boolean descriptorFirst) {
@@ -138,5 +140,62 @@ public class UsbIpIsoProtocolTest {
 		descriptor.status = -32;
 
 		assertEquals("{off=16 len=192 actual=128 status=-32}", descriptor.toString());
+	}
+
+	@Test
+	public void rejectsSubmitWithExcessiveIsoPacketCount() {
+		ByteBuffer header = ByteBuffer.allocate(20).order(ByteOrder.BIG_ENDIAN);
+		header.putInt(UsbIpDevicePacket.USBIP_CMD_SUBMIT);
+		header.putInt(1);
+		header.putInt(0x00010002);
+		header.putInt(UsbIpDevicePacket.USBIP_DIR_IN);
+		header.putInt(1);
+
+		ByteBuffer submit = ByteBuffer.allocate(28).order(ByteOrder.BIG_ENDIAN);
+		submit.putInt(0);
+		submit.putInt(0);
+		submit.putInt(0);
+		submit.putInt(20000);
+		submit.putInt(1);
+		submit.put(new byte[8]);
+
+		byte[] packet = ByteBuffer.allocate(header.capacity() + submit.capacity())
+				.put(header.array())
+				.put(submit.array())
+				.array();
+
+		try {
+			UsbIpDevicePacket.read(new ByteArrayInputStream(packet));
+			fail("Expected IOException for excessive ISO packet count");
+		}
+		catch (IOException expected) {
+			// expected
+		}
+	}
+
+	@Test
+	public void rejectsTruncatedUnlinkHeaderPadding() {
+		ByteBuffer header = ByteBuffer.allocate(20).order(ByteOrder.BIG_ENDIAN);
+		header.putInt(UsbIpDevicePacket.USBIP_CMD_UNLINK);
+		header.putInt(9);
+		header.putInt(0x00010002);
+		header.putInt(UsbIpDevicePacket.USBIP_DIR_OUT);
+		header.putInt(1);
+
+		ByteBuffer unlink = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN);
+		unlink.putInt(7);
+
+		byte[] truncated = ByteBuffer.allocate(header.capacity() + unlink.capacity())
+				.put(header.array())
+				.put(unlink.array())
+				.array();
+
+		try {
+			UsbIpDevicePacket.read(new ByteArrayInputStream(truncated));
+			fail("Expected IOException for truncated unlink packet");
+		}
+		catch (IOException expected) {
+			// expected
+		}
 	}
 }

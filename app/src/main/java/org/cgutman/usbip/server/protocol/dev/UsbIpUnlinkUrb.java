@@ -26,8 +26,9 @@ public class UsbIpUnlinkUrb extends UsbIpDevicePacket {
 		msg.seqNumToUnlink = bb.getInt();
 		
 		// Finish reading the remaining bytes of the header as padding
-		for (int i = 0; i < UsbIpDevicePacket.USBIP_HEADER_SIZE - (header.length + bb.position()); i++) {
-			in.read();
+		int paddingLength = UsbIpDevicePacket.USBIP_HEADER_SIZE - (header.length + bb.position());
+		if (paddingLength > 0) {
+			StreamUtils.readAll(in, new byte[paddingLength]);
 		}
 		
 		return msg;
