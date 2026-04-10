@@ -9,6 +9,8 @@ import java.util.Arrays;
 import org.cgutman.usbip.utils.StreamUtils;
 
 public class UsbIpSubmitUrb extends UsbIpDevicePacket {	
+	private static final int MAX_ISO_PACKET_DESCRIPTORS = 16384;
+
 	public int transferFlags;
 	public int transferBufferLength;
 	public int startFrame;
@@ -42,24 +44,34 @@ public class UsbIpSubmitUrb extends UsbIpDevicePacket {
 		msg.setup = new byte[8];
 		bb.get(msg.setup);
 		
-		// Finish reading the remaining bytes of the header as padding
-		while (bb.position() < UsbIpDevicePacket.USBIP_HEADER_SIZE - header.length) {
-			in.read();
-			bb.position(bb.position()+1);
+		int paddingLength = UsbIpDevicePacket.USBIP_HEADER_SIZE - header.length - WIRE_SIZE;
+		if (paddingLength > 0) {
+			StreamUtils.readAll(in, new byte[paddingLength]);
 		}
 
 		if (msg.transferBufferLength < 0 || msg.numberOfPackets < 0) {
 			throw new IOException("Invalid USB/IP submit lengths");
 		}
+		if (msg.numberOfPackets > MAX_ISO_PACKET_DESCRIPTORS) {
+			throw new IOException("Too many ISO descriptors: " + msg.numberOfPackets);
+		}
 		
-		int isoDescWireLength = msg.numberOfPackets * UsbIpIsoPacketDescriptor.WIRE_SIZE;
+		long isoDescWireLengthLong = (long) msg.numberOfPackets * UsbIpIsoPacketDescriptor.WIRE_SIZE;
+		if (isoDescWireLengthLong > Integer.MAX_VALUE) {
+			throw new IOException("ISO descriptor payload too large");
+		}
+		int isoDescWireLength = (int) isoDescWireLengthLong;
 		int outWireLength = msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT ?
 				msg.transferBufferLength : 0;
+		long variableWireLengthLong = (long) outWireLength + isoDescWireLength;
+		if (variableWireLengthLong > Integer.MAX_VALUE) {
+			throw new IOException("USB/IP submit payload too large");
+		}
 		if (msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT) {
 			// Keep legacy behavior: always provide a non-null payload for OUT URBs, including zero-length ones.
 			msg.outData = new byte[outWireLength];
 		}
-		int variableWireLength = outWireLength + isoDescWireLength;
+		int variableWireLength = (int) variableWireLengthLong;
 		if (variableWireLength > 0) {
 			byte[] variableData = new byte[variableWireLength];
 			StreamUtils.readAll(in, variableData);

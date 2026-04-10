@@ -4,6 +4,7 @@
 #include <time.h>
 
 #include <errno.h>
+#include <limits.h>
 #include <linux/usbdevice_fs.h>
 #include <sys/ioctl.h>
 
@@ -39,6 +40,13 @@ Java_org_cgutman_usbip_jni_UsbLib_doControlTransfer(
         JNIEnv *env, jclass clazz, jint fd, jbyte requestType, jbyte request, jshort value,
         jshort index, jbyteArray data, jint length, jint timeout)
 {
+    (void)clazz;
+
+    jsize dataLen = data ? (*env)->GetArrayLength(env, data) : 0;
+    if (length < 0 || (length > 0 && data == NULL) || length > dataLen) {
+        return -EINVAL;
+    }
+
     jbyte* dataPtr = data ? (jbyte*)(*env)->GetPrimitiveArrayCritical(env, data, NULL) : NULL;
 
     struct usbdevfs_ctrltransfer xfer = {
@@ -95,6 +103,9 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
             packet_count != (*env)->GetArrayLength(env, packet_statuses)) {
         return createIsoResultArray(env, -EINVAL, 0, 0);
     }
+    if (packet_count > 16384) {
+        return createIsoResultArray(env, -EINVAL, 0, 0);
+    }
 
     jsize data_len = data ? (*env)->GetArrayLength(env, data) : 0;
     jbyte *data_ptr = data ? (jbyte *)(*env)->GetPrimitiveArrayCritical(env, data, NULL) : NULL;
@@ -130,7 +141,7 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
         return createIsoResultArray(env, -ENOMEM, 0, 0);
     }
 
-    int total_requested_length = 0;
+    long long total_requested_length = 0;
     for (jsize i = 0; i < packet_count; i++) {
         if (packet_lengths_ptr[i] < 0) {
             free(urb);
@@ -145,9 +156,19 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
 
         urb->iso_frame_desc[i].length = (unsigned int)packet_lengths_ptr[i];
         total_requested_length += packet_lengths_ptr[i];
+        if (total_requested_length > INT_MAX) {
+            free(urb);
+            if (data_ptr) {
+                (*env)->ReleasePrimitiveArrayCritical(env, data, data_ptr, JNI_ABORT);
+            }
+            (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
+            (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
+            (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
+            return createIsoResultArray(env, -EINVAL, 0, 0);
+        }
     }
 
-    if (total_requested_length > data_len) {
+    if (total_requested_length > (long long)data_len) {
         free(urb);
         if (data_ptr) {
             (*env)->ReleasePrimitiveArrayCritical(env, data, data_ptr, JNI_ABORT);

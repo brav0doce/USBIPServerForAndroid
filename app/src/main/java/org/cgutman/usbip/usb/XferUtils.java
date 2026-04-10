@@ -7,6 +7,7 @@ import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbEndpoint;
 
 public class XferUtils {
+	private static final int ERRNO_EINVAL = -22;
 	private static final int ERRNO_ETIMEDOUT = -110;
 
 	public static class IsoTransferResult {
@@ -73,6 +74,15 @@ public class XferUtils {
 
 	public static int doControlTransfer(UsbDeviceConnection devConn, int requestType,
 			int request, int value, int index, byte[] buff, int length, int interval) {
+		if (length < 0) {
+			return ERRNO_EINVAL;
+		}
+		if (length > 0 && buff == null) {
+			return ERRNO_EINVAL;
+		}
+		if (buff != null && length > buff.length) {
+			return ERRNO_EINVAL;
+		}
 		
 		// Mask out possible sign expansions
 		requestType &= 0xFF;
