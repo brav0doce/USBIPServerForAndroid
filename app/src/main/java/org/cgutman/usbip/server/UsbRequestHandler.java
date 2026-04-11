@@ -10,11 +10,12 @@ public interface UsbRequestHandler {
 	public List<UsbDeviceInfo> getDevices();
 	public UsbDeviceInfo getDeviceByBusId(String busId);
 	
-	public boolean attachToDevice(Socket s, String busId);
+	public int attachToDevice(Socket s, String busId);
 	public void detachFromDevice(Socket s, String busId);
 	
 	public void submitUrbRequest(Socket s, UsbIpSubmitUrb msg);
 	public void abortUrbRequest(Socket s, UsbIpUnlinkUrb msg);
 	
+        public int getUsbFd(Socket s);
 	public void cleanupSocket(Socket s);
 }

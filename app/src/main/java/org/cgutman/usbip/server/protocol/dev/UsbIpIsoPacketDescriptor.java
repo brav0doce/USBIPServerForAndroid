@@ -13,7 +13,7 @@ public class UsbIpIsoPacketDescriptor {
 
 	public static UsbIpIsoPacketDescriptor[] deserializeList(byte[] data, int offset, int count) {
 		UsbIpIsoPacketDescriptor[] descriptors = new UsbIpIsoPacketDescriptor[count];
-		ByteBuffer bb = ByteBuffer.wrap(data, offset, count * WIRE_SIZE).order(ByteOrder.BIG_ENDIAN);
+		ByteBuffer bb = ByteBuffer.wrap(data, offset, count * WIRE_SIZE).order(ByteOrder.LITTLE_ENDIAN);
 		for (int i = 0; i < count; i++) {
 			UsbIpIsoPacketDescriptor descriptor = new UsbIpIsoPacketDescriptor();
 			descriptor.offset = bb.getInt();
@@ -30,7 +30,7 @@ public class UsbIpIsoPacketDescriptor {
 			return new byte[0];
 		}
 
-		ByteBuffer bb = ByteBuffer.allocate(descriptors.length * WIRE_SIZE).order(ByteOrder.BIG_ENDIAN);
+		ByteBuffer bb = ByteBuffer.allocate(descriptors.length * WIRE_SIZE).order(ByteOrder.LITTLE_ENDIAN);
 		for (UsbIpIsoPacketDescriptor descriptor : descriptors) {
 			bb.putInt(descriptor.offset);
 			bb.putInt(descriptor.length);

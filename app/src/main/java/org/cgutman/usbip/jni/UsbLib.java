@@ -12,4 +12,6 @@ public class UsbLib {
 
 	public static native int[] doIsoTransfer(int fd, int endpoint, byte[] data, int timeout,
 											 int[] packetLengths, int[] packetActualLengths, int[] packetStatuses);
+
+	public static native int runNativeDeviceLoop(int usbFd, int tcpSocketFd);
 }

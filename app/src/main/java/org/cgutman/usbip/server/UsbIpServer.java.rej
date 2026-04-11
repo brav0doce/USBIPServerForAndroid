@@ -1,0 +1,37 @@
+--- app/src/main/java/org/cgutman/usbip/server/UsbIpServer.java
++++ app/src/main/java/org/cgutman/usbip/server/UsbIpServer.java
+@@ -48,8 +48,9 @@
+                         ImportDeviceRequest imReq = (ImportDeviceRequest)inMsg;
+                         ImportDeviceReply imReply = new ImportDeviceReply(inMsg.version);
+ 
+-                        res = handler.attachToDevice(s, imReq.busid);
+-                        if (res) {
++                        int usbFd = handler.attachToDevice(s, imReq.busid);
++                        res = (usbFd != -1);
++                        if (res) {
+                                 imReply.devInfo = handler.getDeviceByBusId(imReq.busid);
+                                 if (imReply.devInfo == null) {
+                                         res = false;
+@@ -62,7 +63,22 @@
+                                 imReply.status = ProtoDefs.ST_NA;
+                         }
+                         outMsg = imReply;
++
++                        System.out.printf("Out code: 0x%x\n", outMsg.code);
++                        s.getOutputStream().write(outMsg.serialize());
++
++                        if (res) {
++                            try {
++                                android.os.ParcelFileDescriptor pfd = android.os.ParcelFileDescriptor.fromSocket(s);
++                                int tcpFd = pfd.detachFd();
++                                org.cgutman.usbip.jni.UsbLib.runNativeDeviceLoop(usbFd, tcpFd);
++                            } catch (Exception e) {
++                                e.printStackTrace();
++                            }
++                            return false;
++                        }
++                        return res;
+                 }
+                 else {
+                         return false;
+                 }

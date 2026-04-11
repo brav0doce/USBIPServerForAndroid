@@ -775,12 +775,12 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 	public int attachToDevice(Socket s, String busId) {
 		UsbDevice dev = getDevice(busId);
 		if (dev == null) {
-			return -1;
+			return false;
 		}
 		
 		if (connections.get(dev.getDeviceId()) != null) {
 			// Already attached
-			return -1;
+			return false;
 		}
 		
 		if (!usbManager.hasPermission(dev)) {
@@ -792,20 +792,20 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 					try {
 						dev.wait(1000);
 					} catch (InterruptedException e) {
-						return -1;
+						return false;
 					}
 				}
 			}
 			
 			// User may have rejected this
 			if (!permission.get(dev.getDeviceId())) {
-				return -1;
+				return false;
 			}
 		}
 		
 		UsbDeviceConnection devConn = usbManager.openDevice(dev);
 		if (devConn == null) {
-			return -1;
+			return false;
 		}
 		
 		// Create a context for this attachment
@@ -843,7 +843,7 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 		socketMap.put(s, context);
 		
 		updateNotification();
-		return devConn.getFileDescriptor();
+		return true;
 	}
 	
 	private void cleanupDetachedDevice(int deviceId) {

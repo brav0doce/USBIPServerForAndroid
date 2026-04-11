@@ -1,0 +1,104 @@
+--- app/src/main/jni/usblib/usblib_jni.c
++++ app/src/main/jni/usblib/usblib_jni.c
+@@ -10,6 +10,10 @@
+ #include <limits.h>
+ #include <linux/usbdevice_fs.h>
+ #include <sys/ioctl.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <endian.h>
+ 
+ JNIEXPORT jint JNICALL
+ Java_org_cgutman_usbip_jni_UsbLib_doBulkTransfer(
+@@ -370,12 +374,83 @@
+ {
+     (void)env;
+     (void)clazz;
+-    (void)usbFd;
+-    (void)tcpSocketFd;
+ 
+-    // Placeholder for the zero-copy C loop for USB/IP.
+-    // This loop would typically use a select/poll on the tcpSocketFd and usbFd
+-    // to handle communication with zero copy (e.g., using splice() or sendfile())
+-    // and interact directly with URBs via ioctl USBDEVFS_SUBMITURB/USBDEVFS_REAPURB.
+-    
++    struct usbip_header_basic {
++        uint32_t command;
++        uint32_t seqnum;
++        uint32_t devid;
++        uint32_t direction;
++        uint32_t ep;
++    } __attribute__((packed));
++
++    struct usbip_header_cmd_submit {
++        struct usbip_header_basic base;
++        uint32_t transfer_flags;
++        int32_t transfer_buffer_length;
++        int32_t start_frame;
++        int32_t number_of_packets;
++        int32_t interval;
++        uint8_t setup[8];
++    } __attribute__((packed));
++
++    struct usbip_header_ret_submit {
++        struct usbip_header_basic base;
++        int32_t status;
++        int32_t actual_length;
++        int32_t start_frame;
++        int32_t number_of_packets;
++        int32_t error_count;
++        uint8_t padding[8];
++    } __attribute__((packed));
++
++    struct usbip_header_cmd_submit cmd_in;
++    struct usbdevfs_urb urb;
++    
++    while (1) {
++        ssize_t bytes_read = recv(tcpSocketFd, &cmd_in, sizeof(cmd_in), MSG_WAITALL);
++        if (bytes_read <= 0) break;
++
++        int is_out = (ntohl(cmd_in.base.direction) == 0); 
++        jint buffer_len = ntohl(cmd_in.transfer_buffer_length);
++
++        void* buffer = NULL;
++        if (buffer_len > 0) {
++            buffer = malloc(buffer_len);
++            if (is_out) {
++                recv(tcpSocketFd, buffer, buffer_len, MSG_WAITALL);
++            }
++        }
++
++        memset(&urb, 0, sizeof(urb));
++        urb.type = (ntohl(cmd_in.base.ep) == 0) ? USBDEVFS_URB_TYPE_CONTROL : USBDEVFS_URB_TYPE_BULK;
++        urb.endpoint = ntohl(cmd_in.base.ep);
++        if (!is_out) urb.endpoint |= 0x80; 
++        urb.buffer = buffer;
++        urb.buffer_length = buffer_len;
++        urb.usercontext = (void*) (uintptr_t) cmd_in.base.seqnum;
++
++        int res = ioctl(usbFd, USBDEVFS_SUBMITURB, &urb);
++        
++        struct usbdevfs_urb* reaped_urb = NULL;
++        res = ioctl(usbFd, USBDEVFS_REAPURBD, &reaped_urb);
++
++        struct usbip_header_ret_submit ret_out;
++        memset(&ret_out, 0, sizeof(ret_out));
++        ret_out.base.command = htonl(0x00000003); 
++        ret_out.base.seqnum = cmd_in.base.seqnum;
++        ret_out.base.devid = cmd_in.base.devid;
++        ret_out.base.direction = cmd_in.base.direction;
++        ret_out.base.ep = cmd_in.base.ep;
++        
++        ret_out.status = htonl(reaped_urb ? reaped_urb->status : -1);
++        ret_out.actual_length = htonl(reaped_urb ? reaped_urb->actual_length : 0);
++
++        send(tcpSocketFd, &ret_out, sizeof(ret_out), 0);
++        
++        if (buffer && !is_out && reaped_urb && reaped_urb->actual_length > 0) {
++             send(tcpSocketFd, buffer, reaped_urb->actual_length, 0);
++        }
++
++        if (buffer) free(buffer);
++    }
+     return 0;
