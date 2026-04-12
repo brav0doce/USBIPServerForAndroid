@@ -396,7 +396,7 @@ void* usb_reaper_thread(void* arg) {
     
     while(1) {
         struct usbdevfs_urb* reaped_urb = NULL;
-        int res = ioctl(usbFd, USBDEVFS_REAPURBD, &reaped_urb);
+        int res = ioctl(usbFd, USBDEVFS_REAPURB, &reaped_urb);
         if (res < 0) {
             if (errno == ENODEV) break; // Device disconnected
             continue;
@@ -457,7 +457,7 @@ void* usb_reaper_thread(void* arg) {
             for (int i=0; i<ctx->number_of_packets; i++) {
                 // USB/IP Linux quirk: ISO Descriptors are often sent in Host Endianness 
                 // So we leave them un-swapped (Little Endian on Android)
-                iso_out.offset = reaped_urb->iso_frame_desc[i].offset;
+                iso_out.offset = 0; // Not available in Android NDK usbdevfs_iso_packet_desc
                 iso_out.length = reaped_urb->iso_frame_desc[i].length;
                 iso_out.actual_length = reaped_urb->iso_frame_desc[i].actual_length;
                 iso_out.status = reaped_urb->iso_frame_desc[i].status;
@@ -626,8 +626,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
     // Close sockets forcefully so reaper thread terminates.
     // Memory leak on exit is acceptable per thread shutdown logic for detached state.
     shutdown(tcpSocketFd, SHUT_RDWR);
-    pthread_cancel(reaper);
-    pthread_join(reaper, NULL);
+    pthread_detach(reaper);
     
     return 0;
 }

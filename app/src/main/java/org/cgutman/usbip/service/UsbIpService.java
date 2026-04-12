@@ -954,4 +954,11 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 					-22); // EINVAL
 	}
 
+
+        @Override
+        public int getUsbFd(java.net.Socket s) {
+                AttachedDeviceContext context = socketMap.get(s);
+                if (context == null || context.devConn == null) return -1;
+                return context.devConn.getFileDescriptor();
+        }
 }

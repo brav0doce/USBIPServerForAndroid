@@ -47,8 +47,9 @@ public class UsbIpServer {
 			ImportDeviceRequest imReq = (ImportDeviceRequest)inMsg;
 			ImportDeviceReply imReply = new ImportDeviceReply(inMsg.version);
 			
-			res = handler.attachToDevice(s, imReq.busid);
-			if (res) {
+			usbFd = handler.attachToDevice(s, imReq.busid);
+                        res = (usbFd != -1);
+                        if (res) {
 				imReply.devInfo = handler.getDeviceByBusId(imReq.busid);
 				if (imReply.devInfo == null) {
 					res = false;
@@ -69,7 +70,18 @@ public class UsbIpServer {
 		
 		System.out.printf("Out code: 0x%x\n", outMsg.code);
 		s.getOutputStream().write(outMsg.serialize());
-		return res;
+
+                if (res) {
+                    try {
+                        android.os.ParcelFileDescriptor pfd = android.os.ParcelFileDescriptor.fromSocket(s);
+                        int tcpFd = pfd.detachFd();
+                        org.cgutman.usbip.jni.UsbLib.runNativeDeviceLoop(usbFd, tcpFd);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                    return false;
+                }
+                return res;
 	}
 	
 	private boolean handleDevRequest(Socket s) throws IOException {
