@@ -433,9 +433,8 @@ void* usb_reaper_thread(void* arg) {
         ret_out.base.ep = ctx->ep;
         
         int payload_len = reaped_urb->actual_length;
-        if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL && payload_len >= 8) {
-            payload_len -= 8;
-        }
+        /* usbfs actual_length exclusively accounts for the data phase, NOT the setup packet, 
+           so NO subtraction is needed here. */
 
         ret_out.status = htonl(reaped_urb->status);
         ret_out.actual_length = htonl(payload_len);
