@@ -573,7 +573,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
             
             if (urb->type == USBDEVFS_URB_TYPE_CONTROL) {
                 // For control transfers, setup packet is prefixed to data buffer in Linux kernel struct usbdevfs_urb
-                void* ctrl_buf = malloc(8 + data_wire_len);
+                void* ctrl_buf = malloc(8 + buffer_len);
                 memcpy(ctrl_buf, cmd_sub.setup, 8);
                 if (buffer) {
                     memcpy(ctrl_buf + 8, buffer, data_wire_len);
@@ -583,6 +583,10 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 urb->buffer = ctrl_buf;
                 urb->buffer_length = 8 + buffer_len;
             } else {
+                if (!buffer && buffer_len > 0) {
+                    buffer = calloc(1, buffer_len);
+                }
+                ctx->buffer = buffer;
                 urb->buffer = buffer;
                 urb->buffer_length = buffer_len;
             }
