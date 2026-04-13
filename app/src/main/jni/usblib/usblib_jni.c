@@ -432,8 +432,13 @@ void* usb_reaper_thread(void* arg) {
         ret_out.base.direction = ctx->direction;
         ret_out.base.ep = ctx->ep;
         
+        int payload_len = reaped_urb->actual_length;
+        if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL && payload_len >= 8) {
+            payload_len -= 8;
+        }
+
         ret_out.status = htonl(reaped_urb->status);
-        ret_out.actual_length = htonl(reaped_urb->actual_length);
+        ret_out.actual_length = htonl(payload_len);
         ret_out.start_frame = htonl(reaped_urb->start_frame);
         ret_out.number_of_packets = htonl(ctx->number_of_packets);
         ret_out.error_count = htonl(reaped_urb->error_count);
@@ -441,27 +446,27 @@ void* usb_reaper_thread(void* arg) {
         send(tcpFd, &ret_out, sizeof(ret_out), MSG_NOSIGNAL);
         
         // send data for IN requests
-        if (ctx->buffer && ntohl(ctx->direction) != 0 && reaped_urb->actual_length > 0) {
+        if (ctx->buffer && ntohl(ctx->direction) != 0 && payload_len > 0) {
             if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) {
-                // For Control transfers, the first 8 bytes of the buffer were strictly the setup packet.
-                // Payload resides right after the setup packet!
-                send(tcpFd, ((char*)ctx->buffer) + 8, reaped_urb->actual_length, MSG_NOSIGNAL);
+                send(tcpFd, ((char*)ctx->buffer) + 8, payload_len, MSG_NOSIGNAL);
             } else {
-                send(tcpFd, ctx->buffer, reaped_urb->actual_length, MSG_NOSIGNAL);
+                send(tcpFd, ctx->buffer, payload_len, MSG_NOSIGNAL);
             }
         }
 
         // send ISO descriptors if needed
         if (ctx->number_of_packets > 0) {
             struct usbip_iso_packet_descriptor iso_out;
+            int current_offset = 0;
             for (int i=0; i<ctx->number_of_packets; i++) {
                 // USB/IP Linux quirk: ISO Descriptors are often sent in Host Endianness 
                 // So we leave them un-swapped (Little Endian on Android)
-                iso_out.offset = 0; // Not available in Android NDK usbdevfs_iso_packet_desc
+                iso_out.offset = current_offset; 
                 iso_out.length = reaped_urb->iso_frame_desc[i].length;
                 iso_out.actual_length = reaped_urb->iso_frame_desc[i].actual_length;
                 iso_out.status = reaped_urb->iso_frame_desc[i].status;
                 send(tcpFd, &iso_out, sizeof(iso_out), MSG_NOSIGNAL);
+                current_offset += iso_out.length;
             }
         }
 
