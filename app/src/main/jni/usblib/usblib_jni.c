@@ -504,14 +504,43 @@ static void* usb_reaper_thread(void* arg) {
         size_t payload_len = 0;
         int is_in = (ntohl(ctx->direction) != 0);
 
-        if (is_in && actual > 0 && ctx->buffer) {
+        if (is_in && ctx->buffer) {
             if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) {
-                /* usbfs puts data after the 8-byte setup packet in the buffer */
-                payload_ptr = ((char*)ctx->buffer) + 8;
+                if (actual > 0) {
+                    /* usbfs puts data after the 8-byte setup packet in the buffer */
+                    payload_ptr = ((char*)ctx->buffer) + 8;
+                    payload_len = actual;
+                }
+            } else if (ctx->urb.type == USBDEVFS_URB_TYPE_ISO) {
+                /* USBIP expects ISO IN payloads to be tightly packed by actual_length 
+                 * but usbfs spaces them by their maximum `length`. We must pack them 
+                 * in-place before sending. */
+                uint32_t current_offset = 0;
+                uint32_t packed_offset = 0;
+                for (int i = 0; i < ctx->number_of_packets; i++) {
+                    uint32_t frame_len = reaped->iso_frame_desc[i].length;
+                    uint32_t frame_act = reaped->iso_frame_desc[i].actual_length;
+                    if (frame_act > 0 && packed_offset != current_offset) {
+                        memmove(((uint8_t*)ctx->buffer) + packed_offset,
+                                ((uint8_t*)ctx->buffer) + current_offset,
+                                frame_act);
+                    }
+                    current_offset += frame_len;
+                    packed_offset += frame_act;
+                }
+                if (packed_offset > 0) {
+                    payload_ptr = ctx->buffer;
+                    payload_len = packed_offset;
+                }
+                
+                /* Ensure overall actual length matches packed length */
+                ret.actual_length = htonl(packed_offset);
             } else {
-                payload_ptr = ctx->buffer;
+                if (actual > 0) {
+                    payload_ptr = ctx->buffer;
+                    payload_len = actual;
+                }
             }
-            payload_len = actual;
         }
 
         /* Build ISO descriptors if needed */
@@ -524,10 +553,10 @@ static void* usb_reaper_thread(void* arg) {
                 struct usbip_iso_packet_descriptor* descs = (struct usbip_iso_packet_descriptor*)iso_buf;
                 uint32_t offset = 0;
                 for (int i = 0; i < ctx->number_of_packets; i++) {
-                    descs[i].offset        = offset;
-                    descs[i].length        = reaped->iso_frame_desc[i].length;
-                    descs[i].actual_length = reaped->iso_frame_desc[i].actual_length;
-                    descs[i].status        = reaped->iso_frame_desc[i].status;
+                    descs[i].offset        = htonl(offset);
+                    descs[i].length        = htonl(reaped->iso_frame_desc[i].length);
+                    descs[i].actual_length = htonl(reaped->iso_frame_desc[i].actual_length);
+                    descs[i].status        = htonl(reaped->iso_frame_desc[i].status);
                     offset += reaped->iso_frame_desc[i].length;
                 }
             }
@@ -675,7 +704,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 struct usbip_iso_packet_descriptor* d =
                     (struct usbip_iso_packet_descriptor*)iso_in;
                 for (int i = 0; i < num_iso; i++) {
-                    urb->iso_frame_desc[i].length = d[i].length;
+                    urb->iso_frame_desc[i].length = ntohl(d[i].length);
                     urb->iso_frame_desc[i].actual_length = 0;
                     urb->iso_frame_desc[i].status = 0;
                 }
