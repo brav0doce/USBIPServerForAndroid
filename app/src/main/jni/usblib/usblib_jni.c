@@ -348,6 +348,50 @@ struct usbip_iso_packet_descriptor {
     uint32_t status;
 } __attribute__((packed));
 
+/* Legacy Java path used little-endian ISO descriptors on the wire. Keep
+ * compatibility while still accepting big-endian descriptors from strict clients. */
+static uint32_t read_u32_le(const uint8_t* p) {
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint32_t read_u32_be(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           ((uint32_t)p[3]);
+}
+
+static void write_u32_le(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static int parse_iso_desc_lengths(const uint8_t* raw, int num_iso, int transfer_buffer_len,
+                                  int use_little_endian, uint32_t* lengths_out) {
+    if (!raw || num_iso < 0 || !lengths_out) return 0;
+
+    for (int i = 0; i < num_iso; i++) {
+        const uint8_t* d = raw + (i * (int)sizeof(struct usbip_iso_packet_descriptor));
+        uint32_t off = use_little_endian ? read_u32_le(d + 0)  : read_u32_be(d + 0);
+        uint32_t len = use_little_endian ? read_u32_le(d + 4)  : read_u32_be(d + 4);
+        uint32_t act = use_little_endian ? read_u32_le(d + 8)  : read_u32_be(d + 8);
+
+        if (act > len) return 0;
+        if (off > (uint32_t)transfer_buffer_len) return 0;
+        if (len > (uint32_t)transfer_buffer_len) return 0;
+        if ((uint64_t)off + (uint64_t)len > (uint64_t)transfer_buffer_len) return 0;
+
+        lengths_out[i] = len;
+    }
+
+    return 1;
+}
+
 /* ---- Per-URB context ---- */
 
 struct urb_context {
@@ -550,14 +594,25 @@ static void* usb_reaper_thread(void* arg) {
             iso_buf_len = ctx->number_of_packets * sizeof(struct usbip_iso_packet_descriptor);
             iso_buf = malloc(iso_buf_len);
             if (iso_buf) {
-                struct usbip_iso_packet_descriptor* descs = (struct usbip_iso_packet_descriptor*)iso_buf;
+                uint8_t* descs = (uint8_t*)iso_buf;
                 uint32_t offset = 0;
                 for (int i = 0; i < ctx->number_of_packets; i++) {
-                    descs[i].offset        = htonl(offset);
-                    descs[i].length        = htonl(reaped->iso_frame_desc[i].length);
-                    descs[i].actual_length = htonl(reaped->iso_frame_desc[i].actual_length);
-                    descs[i].status        = htonl(reaped->iso_frame_desc[i].status);
-                    offset += reaped->iso_frame_desc[i].length;
+                    uint32_t frame_len = reaped->iso_frame_desc[i].length;
+                    uint32_t frame_act = reaped->iso_frame_desc[i].actual_length;
+                    uint32_t frame_sts = reaped->iso_frame_desc[i].status;
+
+                    write_u32_le(descs + (i * 16) + 0, offset);
+                    write_u32_le(descs + (i * 16) + 4, frame_len);
+                    write_u32_le(descs + (i * 16) + 8, frame_act);
+                    write_u32_le(descs + (i * 16) + 12, frame_sts);
+
+                    /* IN payload is packed by actual_length above, so descriptor offsets must
+                     * follow packed layout for client-side parsing. */
+                    if (is_in) {
+                        offset += frame_act;
+                    } else {
+                        offset += frame_len;
+                    }
                 }
             }
         }
@@ -661,22 +716,19 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
             int data_wire  = is_out ? buf_len : 0;
             int iso_wire   = num_iso * (int)sizeof(struct usbip_iso_packet_descriptor);
 
-            /* Read OUT payload from network */
             void* buffer = NULL;
-            if (data_wire > 0) {
-                buffer = malloc(data_wire);
-                if (!buffer) break;
-                if (recv_all(tcpSocketFd, buffer, data_wire) < 0) { free(buffer); break; }
+            uint8_t* variable_wire_data = NULL;
+            int variable_wire_len = data_wire + iso_wire;
+            if (variable_wire_len < 0) {
+                break;
             }
-
-            /* Read ISO descriptors from network */
-            void* iso_in = NULL;
-            if (iso_wire > 0) {
-                iso_in = malloc(iso_wire);
-                if (!iso_in) { if (buffer) free(buffer); break; }
-                if (recv_all(tcpSocketFd, iso_in, iso_wire) < 0) {
-                    free(iso_in);
-                    if (buffer) free(buffer);
+            if (variable_wire_len > 0) {
+                variable_wire_data = malloc((size_t)variable_wire_len);
+                if (!variable_wire_data) {
+                    break;
+                }
+                if (recv_all(tcpSocketFd, variable_wire_data, (size_t)variable_wire_len) < 0) {
+                    free(variable_wire_data);
                     break;
                 }
             }
@@ -686,7 +738,6 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 sizeof(struct urb_context) + sizeof(struct usbdevfs_iso_packet_desc) * num_iso);
             if (!ctx) {
                 if (buffer) free(buffer);
-                if (iso_in) free(iso_in);
                 break;
             }
 
@@ -701,19 +752,94 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
             /* Determine URB type */
             if (num_iso > 0) {
                 urb->type = USBDEVFS_URB_TYPE_ISO;
-                struct usbip_iso_packet_descriptor* d =
-                    (struct usbip_iso_packet_descriptor*)iso_in;
+
+                uint32_t* parsed_lengths = calloc((size_t)num_iso, sizeof(uint32_t));
+                int parsed_ok = 0;
+
+                if (!parsed_lengths) {
+                    if (variable_wire_data) free(variable_wire_data);
+                    free(ctx);
+                    break;
+                }
+
+                if (iso_wire > 0 && variable_wire_data) {
+                    /* Accept both historic (descriptors first) and Linux-style
+                     * (descriptors last) layouts for ISO OUT payload. */
+                    uint8_t* first = variable_wire_data;
+                    uint8_t* last = variable_wire_data + data_wire;
+
+                    int first_le = parse_iso_desc_lengths(first, num_iso, buf_len, 1, parsed_lengths);
+                    int first_be = !first_le && parse_iso_desc_lengths(first, num_iso, buf_len, 0, parsed_lengths);
+                    int last_le = (is_out && data_wire > 0) ? parse_iso_desc_lengths(last, num_iso, buf_len, 1, parsed_lengths) : 0;
+                    int last_be = (is_out && data_wire > 0 && !last_le) ? parse_iso_desc_lengths(last, num_iso, buf_len, 0, parsed_lengths) : 0;
+
+                    if (is_out && data_wire > 0) {
+                        int use_first = (first_le || first_be) && !(last_le || last_be);
+                        int use_last = (last_le || last_be) && !(first_le || first_be);
+
+                        if (!use_first && !use_last) {
+                            /* If ambiguous or neither plausible, follow Linux USB/IP order:
+                             * data first, descriptors last. */
+                            use_last = 1;
+                        }
+
+                        if (use_first) {
+                            buffer = malloc((size_t)data_wire);
+                            if (!buffer) {
+                                free(parsed_lengths);
+                                free(variable_wire_data);
+                                free(ctx);
+                                break;
+                            }
+                            memcpy(buffer, variable_wire_data + iso_wire, (size_t)data_wire);
+                            parsed_ok = (first_le || first_be) ? 1 : 0;
+                        } else {
+                            buffer = malloc((size_t)data_wire);
+                            if (!buffer) {
+                                free(parsed_lengths);
+                                free(variable_wire_data);
+                                free(ctx);
+                                break;
+                            }
+                            memcpy(buffer, variable_wire_data, (size_t)data_wire);
+                            parsed_ok = (last_le || last_be) ? 1 : 0;
+                        }
+                    } else {
+                        parsed_ok = first_le || first_be;
+                    }
+                }
+
+                if (!parsed_ok && num_iso > 0) {
+                    free(parsed_lengths);
+                    if (variable_wire_data) free(variable_wire_data);
+                    if (buffer) free(buffer);
+                    free(ctx);
+                    break;
+                }
+
                 for (int i = 0; i < num_iso; i++) {
-                    urb->iso_frame_desc[i].length = ntohl(d[i].length);
+                    urb->iso_frame_desc[i].length = parsed_lengths[i];
                     urb->iso_frame_desc[i].actual_length = 0;
                     urb->iso_frame_desc[i].status = 0;
                 }
+
+                free(parsed_lengths);
             } else if (ep_num == 0) {
                 urb->type = USBDEVFS_URB_TYPE_CONTROL;
             } else {
                 urb->type = USBDEVFS_URB_TYPE_BULK;
             }
-            if (iso_in) free(iso_in);
+
+            if (num_iso == 0 && data_wire > 0 && variable_wire_data) {
+                buffer = malloc((size_t)data_wire);
+                if (!buffer) {
+                    free(variable_wire_data);
+                    free(ctx);
+                    break;
+                }
+                memcpy(buffer, variable_wire_data, (size_t)data_wire);
+            }
+            if (variable_wire_data) free(variable_wire_data);
 
             /* Set endpoint byte: For control transfers (ep0), usbfs wants endpoint=0
                (direction is embedded in the setup packet). For others, set 0x80 for IN. */
@@ -735,7 +861,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 }
                 memcpy(ctrl, sub.setup, 8);
                 if (buffer && data_wire > 0) {
-                    memcpy(ctrl + 8, buffer, data_wire);
+                    memcpy(((uint8_t*)ctrl) + 8, buffer, data_wire);
                     free(buffer);
                 }
                 ctx->buffer = ctrl;
