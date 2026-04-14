@@ -267,24 +267,39 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
     return createIsoResultArray(env, transfer_status, transfer_actual_length, transfer_error_count);
 }
 
-/**
- * Core Zero-Copy Native Device Loop for USB/IP protocol.
- * Completely circumvents the Dalvik/ART JVM by managing IO directly via kernel splice/sendfile.
- * Handles Endianness protocol quirks and correctly structures 48-byte URBs.
+/*
+ * ===========================================================================
+ *  USB/IP Native Device Loop
+ *  Implements the device-side (VHCI stub) of the USB/IP protocol per:
+ *  https://docs.kernel.org/usb/usbip_protocol.html
+ *
+ *  Runs entirely in C, bypassing the JVM for maximum throughput.
+ *  Fixes applied:
+ *   - Reliable send/recv loops (handle partial TCP writes/reads)
+ *   - Per-connection URB tracking (no global state leak between sessions)
+ *   - Mutex-protected TCP writes (reaper + main thread share socket)
+ *   - Proper error replies when ioctl SUBMITURB fails
+ *   - Correct control-transfer endpoint handling (ep0 always 0 for usbfs)
+ *   - Proper reaper thread lifecycle (join, not detach)
+ *   - Correct ISO descriptor offset calculation
+ * ===========================================================================
  */
-
 
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <endian.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+
+/* ---- USB/IP wire protocol structures (48 bytes each) ---- */
 
 struct usbip_header_basic {
     uint32_t command;
@@ -297,11 +312,11 @@ struct usbip_header_basic {
 struct usbip_header_cmd_submit {
     struct usbip_header_basic base;
     uint32_t transfer_flags;
-    int32_t transfer_buffer_length;
-    int32_t start_frame;
-    int32_t number_of_packets;
-    int32_t interval;
-    uint8_t setup[8];
+    int32_t  transfer_buffer_length;
+    int32_t  start_frame;
+    int32_t  number_of_packets;
+    int32_t  interval;
+    uint8_t  setup[8];
 } __attribute__((packed));
 
 struct usbip_header_ret_submit {
@@ -317,7 +332,7 @@ struct usbip_header_ret_submit {
 struct usbip_header_cmd_unlink {
     struct usbip_header_basic base;
     uint32_t unlink_seqnum;
-    uint8_t padding[24];
+    uint8_t  padding[24];
 } __attribute__((packed));
 
 struct usbip_header_ret_unlink {
@@ -333,154 +348,235 @@ struct usbip_iso_packet_descriptor {
     uint32_t status;
 } __attribute__((packed));
 
+/* ---- Per-URB context ---- */
+
 struct urb_context {
-    void* buffer;
-    uint32_t seqnum;
+    void*    buffer;
+    uint32_t seqnum;     /* network byte order, as received */
     uint32_t devid;
     uint32_t direction;
     uint32_t ep;
-    uint32_t is_unlink;
-    int32_t number_of_packets;
+    int32_t  number_of_packets;
     struct urb_context* next;
-    // urb must be at the end as it has a variable length array for ISO
-    struct usbdevfs_urb urb;
+    struct usbdevfs_urb urb;  /* variable-length (ISO descs at end) */
 };
 
-// URB Tracking for USBIP_CMD_UNLINK
-pthread_mutex_t urb_list_mutex = PTHREAD_MUTEX_INITIALIZER;
-struct urb_context* active_urbs_head = NULL;
+/* ---- Per-connection state ---- */
 
-void add_urb_context(struct urb_context* ctx) {
-    pthread_mutex_lock(&urb_list_mutex);
-    ctx->next = active_urbs_head;
-    active_urbs_head = ctx;
-    pthread_mutex_unlock(&urb_list_mutex);
+struct connection_state {
+    int usbFd;
+    int tcpFd;
+    volatile int running;       /* set to 0 to signal shutdown */
+    pthread_mutex_t send_mutex; /* protects all send() on tcpFd */
+    pthread_mutex_t urb_mutex;  /* protects active_urbs list */
+    struct urb_context* active_urbs;
+};
+
+/* ---- Reliable TCP I/O helpers ---- */
+
+static int send_all(int fd, const void* buf, size_t len, pthread_mutex_t* mtx) {
+    const uint8_t* p = (const uint8_t*)buf;
+    size_t remaining = len;
+    if (mtx) pthread_mutex_lock(mtx);
+    while (remaining > 0) {
+        ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (mtx) pthread_mutex_unlock(mtx);
+            return -1;
+        }
+        p += n;
+        remaining -= n;
+    }
+    if (mtx) pthread_mutex_unlock(mtx);
+    return 0;
 }
 
-void remove_urb_context(struct urb_context* ctx) {
-    pthread_mutex_lock(&urb_list_mutex);
-    struct urb_context** curr = &active_urbs_head;
-    while (*curr) {
-        if (*curr == ctx) {
-            *curr = ctx->next;
-            break;
+/* Send header + optional payload atomically (under one lock) */
+static int send_header_and_data(int fd, const void* hdr, size_t hdr_len,
+                                const void* data, size_t data_len,
+                                const void* data2, size_t data2_len,
+                                pthread_mutex_t* mtx) {
+    const uint8_t* bufs[3]  = { hdr, data, data2 };
+    size_t lens[3]          = { hdr_len, data_len, data2_len };
+
+    if (mtx) pthread_mutex_lock(mtx);
+    for (int i = 0; i < 3; i++) {
+        if (!bufs[i] || lens[i] == 0) continue;
+        const uint8_t* p = bufs[i];
+        size_t rem = lens[i];
+        while (rem > 0) {
+            ssize_t n = send(fd, p, rem, MSG_NOSIGNAL);
+            if (n <= 0) {
+                if (mtx) pthread_mutex_unlock(mtx);
+                return -1;
+            }
+            p += n;
+            rem -= n;
         }
-        curr = &(*curr)->next;
     }
-    pthread_mutex_unlock(&urb_list_mutex);
+    if (mtx) pthread_mutex_unlock(mtx);
+    return 0;
 }
 
-struct urb_context* find_urb_context_by_seqnum(uint32_t seqnum) {
-    pthread_mutex_lock(&urb_list_mutex);
-    struct urb_context* curr = active_urbs_head;
-    while (curr) {
-        if (curr->seqnum == seqnum) {
-            pthread_mutex_unlock(&urb_list_mutex);
-            return curr;
-        }
-        curr = curr->next;
+static int recv_all(int fd, void* buf, size_t len) {
+    uint8_t* p = (uint8_t*)buf;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = recv(fd, p, remaining, MSG_WAITALL);
+        if (n <= 0) return -1;
+        p += n;
+        remaining -= n;
     }
-    pthread_mutex_unlock(&urb_list_mutex);
+    return 0;
+}
+
+/* ---- URB list management (per-connection) ---- */
+
+static void add_urb(struct connection_state* cs, struct urb_context* ctx) {
+    pthread_mutex_lock(&cs->urb_mutex);
+    ctx->next = cs->active_urbs;
+    cs->active_urbs = ctx;
+    pthread_mutex_unlock(&cs->urb_mutex);
+}
+
+static void remove_urb(struct connection_state* cs, struct urb_context* ctx) {
+    pthread_mutex_lock(&cs->urb_mutex);
+    struct urb_context** pp = &cs->active_urbs;
+    while (*pp) {
+        if (*pp == ctx) { *pp = ctx->next; break; }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&cs->urb_mutex);
+}
+
+static struct urb_context* find_urb_by_seqnum(struct connection_state* cs, uint32_t seqnum_net) {
+    pthread_mutex_lock(&cs->urb_mutex);
+    struct urb_context* c = cs->active_urbs;
+    while (c) {
+        if (c->seqnum == seqnum_net) {
+            pthread_mutex_unlock(&cs->urb_mutex);
+            return c;
+        }
+        c = c->next;
+    }
+    pthread_mutex_unlock(&cs->urb_mutex);
     return NULL;
 }
 
-struct reaper_args {
-    int usbFd;
-    int tcpSocketFd;
-};
+/* ---- Reaper thread: waits for completed URBs and sends replies ---- */
 
-void* usb_reaper_thread(void* arg) {
-    struct reaper_args* args = (struct reaper_args*)arg;
-    int usbFd = args->usbFd;
-    int tcpFd = args->tcpSocketFd;
-    
-    while(1) {
-        struct usbdevfs_urb* reaped_urb = NULL;
-        int res = ioctl(usbFd, USBDEVFS_REAPURB, &reaped_urb);
+static void* usb_reaper_thread(void* arg) {
+    struct connection_state* cs = (struct connection_state*)arg;
+
+    while (cs->running) {
+        struct usbdevfs_urb* reaped = NULL;
+        int res = ioctl(cs->usbFd, USBDEVFS_REAPURB, &reaped);
         if (res < 0) {
-            if (errno == ENODEV) break; // Device disconnected
+            if (errno == ENODEV || !cs->running) break;
+            if (errno == EINTR) continue;
             continue;
         }
-        if (!reaped_urb) continue;
-        
-        struct urb_context* ctx = (struct urb_context*)reaped_urb->usercontext;
+        if (!reaped) continue;
+
+        struct urb_context* ctx = (struct urb_context*)reaped->usercontext;
         if (!ctx) continue;
-        
-        remove_urb_context(ctx);
 
-        if (ctx->is_unlink) {
-            struct usbip_header_ret_unlink ret_un;
-            memset(&ret_un, 0, sizeof(ret_un));
-            ret_un.base.command = htonl(0x00000004); // RET_UNLINK
-            ret_un.base.seqnum = ctx->seqnum;
-            ret_un.base.devid = ctx->devid;
-            ret_un.base.direction = ctx->direction;
-            ret_un.base.ep = ctx->ep;
-            ret_un.status = htonl(reaped_urb->status == -ENOENT ? 0 : reaped_urb->status);
-            send(tcpFd, &ret_un, sizeof(ret_un), MSG_NOSIGNAL);
-            
-            if (ctx->buffer) free(ctx->buffer);
-            free(ctx);
-            continue;
-        }
+        remove_urb(cs, ctx);
 
-        struct usbip_header_ret_submit ret_out;
-        memset(&ret_out, 0, sizeof(ret_out));
-        ret_out.base.command = htonl(0x00000003); // RET_SUBMIT
-        ret_out.base.seqnum = ctx->seqnum;
-        ret_out.base.devid = ctx->devid;
-        ret_out.base.direction = ctx->direction;
-        ret_out.base.ep = ctx->ep;
-        
-        int payload_len = reaped_urb->actual_length;
-        /* usbfs actual_length exclusively accounts for the data phase, NOT the setup packet, 
-           so NO subtraction is needed here. */
+        /* Build the RET_SUBMIT header */
+        struct usbip_header_ret_submit ret;
+        memset(&ret, 0, sizeof(ret));
+        ret.base.command   = htonl(0x00000003); /* USBIP_RET_SUBMIT */
+        ret.base.seqnum    = ctx->seqnum;
+        ret.base.devid     = ctx->devid;
+        ret.base.direction = ctx->direction;
+        ret.base.ep        = ctx->ep;
 
-        ret_out.status = htonl(reaped_urb->status);
-        ret_out.actual_length = htonl(payload_len);
-        ret_out.start_frame = htonl(reaped_urb->start_frame);
-        ret_out.number_of_packets = htonl(ctx->number_of_packets);
-        ret_out.error_count = htonl(reaped_urb->error_count);
+        int actual = reaped->actual_length;
+        ret.status          = htonl(reaped->status);
+        ret.actual_length   = htonl(actual);
+        ret.start_frame     = htonl(reaped->start_frame);
+        ret.number_of_packets = htonl(ctx->number_of_packets);
+        ret.error_count     = htonl(reaped->error_count);
 
-        send(tcpFd, &ret_out, sizeof(ret_out), MSG_NOSIGNAL);
-        
-        // send data for IN requests
-        if (ctx->buffer && ntohl(ctx->direction) != 0 && payload_len > 0) {
+        /* Determine payload to send back (IN direction only) */
+        const void* payload_ptr = NULL;
+        size_t payload_len = 0;
+        int is_in = (ntohl(ctx->direction) != 0);
+
+        if (is_in && actual > 0 && ctx->buffer) {
             if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) {
-                send(tcpFd, ((char*)ctx->buffer) + 8, payload_len, MSG_NOSIGNAL);
+                /* usbfs puts data after the 8-byte setup packet in the buffer */
+                payload_ptr = ((char*)ctx->buffer) + 8;
             } else {
-                send(tcpFd, ctx->buffer, payload_len, MSG_NOSIGNAL);
+                payload_ptr = ctx->buffer;
             }
+            payload_len = actual;
         }
 
-        // send ISO descriptors if needed
+        /* Build ISO descriptors if needed */
+        void* iso_buf = NULL;
+        size_t iso_buf_len = 0;
         if (ctx->number_of_packets > 0) {
-            struct usbip_iso_packet_descriptor iso_out;
-            int current_offset = 0;
-            for (int i=0; i<ctx->number_of_packets; i++) {
-                // USB/IP Linux quirk: ISO Descriptors are often sent in Host Endianness 
-                // So we leave them un-swapped (Little Endian on Android)
-                iso_out.offset = current_offset; 
-                iso_out.length = reaped_urb->iso_frame_desc[i].length;
-                iso_out.actual_length = reaped_urb->iso_frame_desc[i].actual_length;
-                iso_out.status = reaped_urb->iso_frame_desc[i].status;
-                send(tcpFd, &iso_out, sizeof(iso_out), MSG_NOSIGNAL);
-                current_offset += iso_out.length;
+            iso_buf_len = ctx->number_of_packets * sizeof(struct usbip_iso_packet_descriptor);
+            iso_buf = malloc(iso_buf_len);
+            if (iso_buf) {
+                struct usbip_iso_packet_descriptor* descs = (struct usbip_iso_packet_descriptor*)iso_buf;
+                uint32_t offset = 0;
+                for (int i = 0; i < ctx->number_of_packets; i++) {
+                    descs[i].offset        = offset;
+                    descs[i].length        = reaped->iso_frame_desc[i].length;
+                    descs[i].actual_length = reaped->iso_frame_desc[i].actual_length;
+                    descs[i].status        = reaped->iso_frame_desc[i].status;
+                    offset += reaped->iso_frame_desc[i].length;
+                }
             }
         }
 
+        /* Send header + payload + ISO descs atomically */
+        send_header_and_data(cs->tcpFd,
+                             &ret, sizeof(ret),
+                             payload_ptr, payload_len,
+                             iso_buf, iso_buf_len,
+                             &cs->send_mutex);
+
+        if (iso_buf) free(iso_buf);
         if (ctx->buffer) free(ctx->buffer);
         free(ctx);
     }
     return NULL;
 }
 
-/**
- * Core Zero-Copy Native Device Loop for USB/IP protocol.
- * Completely circumvents the Dalvik/ART JVM by managing IO directly via kernel splice/sendfile.
- * Handles Endianness protocol quirks and correctly structures 48-byte URBs.
- * Full ASYNC support for Webcams (ISO) and Pendrives (Mass Storage Bulk).
- */
+/* ---- Send an immediate error RET_SUBMIT for a failed ioctl ---- */
+
+static void send_submit_error(struct connection_state* cs, struct urb_context* ctx, int err) {
+    struct usbip_header_ret_submit ret;
+    memset(&ret, 0, sizeof(ret));
+    ret.base.command   = htonl(0x00000003);
+    ret.base.seqnum    = ctx->seqnum;
+    ret.base.devid     = ctx->devid;
+    ret.base.direction = ctx->direction;
+    ret.base.ep        = ctx->ep;
+    ret.status         = htonl(err);
+
+    /* For ISO failures, also send empty ISO descriptors */
+    void* iso_buf = NULL;
+    size_t iso_len = 0;
+    if (ctx->number_of_packets > 0) {
+        iso_len = ctx->number_of_packets * sizeof(struct usbip_iso_packet_descriptor);
+        iso_buf = calloc(1, iso_len);
+    }
+
+    send_header_and_data(cs->tcpFd,
+                         &ret, sizeof(ret),
+                         NULL, 0,
+                         iso_buf, iso_len,
+                         &cs->send_mutex);
+    if (iso_buf) free(iso_buf);
+}
+
+/* ---- Main entry point ---- */
+
 JNIEXPORT jint JNICALL
 Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
         JNIEnv *env, jclass clazz, jint usbFd, jint tcpSocketFd)
@@ -488,153 +584,224 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
     (void)env;
     (void)clazz;
 
+    /* Ignore SIGPIPE so send() returns EPIPE instead of killing us */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Enable TCP_NODELAY for low latency */
+    int flag = 1;
+    setsockopt(tcpSocketFd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+    /* Per-connection state (heap-allocated so reaper thread has stable pointer) */
+    struct connection_state* cs = calloc(1, sizeof(struct connection_state));
+    if (!cs) return -1;
+    cs->usbFd   = usbFd;
+    cs->tcpFd    = tcpSocketFd;
+    cs->running  = 1;
+    pthread_mutex_init(&cs->send_mutex, NULL);
+    pthread_mutex_init(&cs->urb_mutex, NULL);
+    cs->active_urbs = NULL;
+
     pthread_t reaper;
-    struct reaper_args r_args = { .usbFd = usbFd, .tcpSocketFd = tcpSocketFd };
-    if (pthread_create(&reaper, NULL, usb_reaper_thread, &r_args) != 0) {
-        return -1; // Failed to start async thread
+    if (pthread_create(&reaper, NULL, usb_reaper_thread, cs) != 0) {
+        free(cs);
+        return -1;
     }
 
-    struct usbip_header_basic base_cmd;
-    
-    while (1) {
-        ssize_t bytes_read = recv(tcpSocketFd, &base_cmd, sizeof(base_cmd), MSG_WAITALL);
-        if (bytes_read <= 0) break;
+    /* Main command loop: reads commands from the TCP socket */
+    while (cs->running) {
+        struct usbip_header_basic base;
+        if (recv_all(tcpSocketFd, &base, sizeof(base)) < 0) break;
 
-        uint32_t cmd_type = ntohl(base_cmd.command);
+        uint32_t cmd = ntohl(base.command);
 
-        if (cmd_type == 0x00000001) { // USBIP_CMD_SUBMIT
-            struct usbip_header_cmd_submit cmd_sub;
-            cmd_sub.base = base_cmd;
-            
-            // Read remaining 28 bytes of Submit Header
-            ssize_t rem = recv(tcpSocketFd, ((uint8_t*)&cmd_sub) + 20, 28, MSG_WAITALL);
-            if (rem <= 0) break;
+        if (cmd == 0x00000001) { /* USBIP_CMD_SUBMIT */
+            struct usbip_header_cmd_submit sub;
+            sub.base = base;
+            if (recv_all(tcpSocketFd, ((uint8_t*)&sub) + 20, 28) < 0) break;
 
-            int is_out = (ntohl(cmd_sub.base.direction) == 0); 
-            jint buffer_len = ntohl(cmd_sub.transfer_buffer_length);
-            int num_packets = ntohl(cmd_sub.number_of_packets);
+            int is_out     = (ntohl(sub.base.direction) == 0);
+            int32_t buf_len = (int32_t)ntohl(sub.transfer_buffer_length);
+            int num_iso    = (int32_t)ntohl(sub.number_of_packets);
+            uint32_t ep_num = ntohl(sub.base.ep);
 
-            int iso_wire_len = num_packets * 16;
-            int data_wire_len = is_out ? buffer_len : 0;
-            
+            /* Sanity: limit buffer size */
+            if (buf_len < 0) buf_len = 0;
+            if (buf_len > 16 * 1024 * 1024) { break; }
+            if (num_iso < 0) num_iso = 0;
+
+            int data_wire  = is_out ? buf_len : 0;
+            int iso_wire   = num_iso * (int)sizeof(struct usbip_iso_packet_descriptor);
+
+            /* Read OUT payload from network */
             void* buffer = NULL;
-            void* iso_buffer = NULL;
-            
-            if (data_wire_len > 0 || iso_wire_len > 0) {
-                // USBIP drivers have quirks about descriptor placement (before or after payload)
-                // Standard behavior: Data Payload first, then ISO Descriptors
-                if (data_wire_len > 0) {
-                    buffer = malloc(data_wire_len);
-                    recv(tcpSocketFd, buffer, data_wire_len, MSG_WAITALL);
-                }
-                
-                if (iso_wire_len > 0) {
-                    iso_buffer = malloc(iso_wire_len);
-                    recv(tcpSocketFd, iso_buffer, iso_wire_len, MSG_WAITALL);
+            if (data_wire > 0) {
+                buffer = malloc(data_wire);
+                if (!buffer) break;
+                if (recv_all(tcpSocketFd, buffer, data_wire) < 0) { free(buffer); break; }
+            }
+
+            /* Read ISO descriptors from network */
+            void* iso_in = NULL;
+            if (iso_wire > 0) {
+                iso_in = malloc(iso_wire);
+                if (!iso_in) { if (buffer) free(buffer); break; }
+                if (recv_all(tcpSocketFd, iso_in, iso_wire) < 0) {
+                    free(iso_in);
+                    if (buffer) free(buffer);
+                    break;
                 }
             }
 
-            struct urb_context* ctx = calloc(1, sizeof(struct urb_context) + sizeof(struct usbdevfs_iso_packet_desc) * num_packets);
+            /* Allocate urb_context (with room for ISO frame descriptors) */
+            struct urb_context* ctx = calloc(1,
+                sizeof(struct urb_context) + sizeof(struct usbdevfs_iso_packet_desc) * num_iso);
             if (!ctx) {
                 if (buffer) free(buffer);
-                if (iso_buffer) free(iso_buffer);
+                if (iso_in) free(iso_in);
                 break;
             }
 
-            ctx->buffer = buffer;
-            ctx->seqnum = cmd_sub.base.seqnum;
-            ctx->devid = cmd_sub.base.devid;
-            ctx->direction = cmd_sub.base.direction;
-            ctx->ep = cmd_sub.base.ep;
-            ctx->is_unlink = 0;
-            ctx->number_of_packets = num_packets;
+            ctx->seqnum    = sub.base.seqnum;
+            ctx->devid     = sub.base.devid;
+            ctx->direction = sub.base.direction;
+            ctx->ep        = sub.base.ep;
+            ctx->number_of_packets = num_iso;
 
             struct usbdevfs_urb* urb = &ctx->urb;
-            
-            // Parse ISO descriptors safely
-            if (num_packets > 0 && iso_buffer) {
+
+            /* Determine URB type */
+            if (num_iso > 0) {
                 urb->type = USBDEVFS_URB_TYPE_ISO;
-                struct usbip_iso_packet_descriptor* desc_in = (struct usbip_iso_packet_descriptor*)iso_buffer;
-                for (int i=0; i<num_packets; i++) {
-                    urb->iso_frame_desc[i].length = desc_in[i].length; // assuming little endian quirk
+                struct usbip_iso_packet_descriptor* d =
+                    (struct usbip_iso_packet_descriptor*)iso_in;
+                for (int i = 0; i < num_iso; i++) {
+                    urb->iso_frame_desc[i].length = d[i].length;
                     urb->iso_frame_desc[i].actual_length = 0;
                     urb->iso_frame_desc[i].status = 0;
                 }
-                free(iso_buffer);
-            } else if (ntohl(cmd_sub.base.ep) == 0) {
+            } else if (ep_num == 0) {
                 urb->type = USBDEVFS_URB_TYPE_CONTROL;
             } else {
-                urb->type = USBDEVFS_URB_TYPE_BULK; // Or Interrupt. USBFS infers it from EP descriptor.
+                urb->type = USBDEVFS_URB_TYPE_BULK;
             }
-            
-            urb->endpoint = ntohl(cmd_sub.base.ep);
-            if (!is_out) urb->endpoint |= 0x80; 
-            
+            if (iso_in) free(iso_in);
+
+            /* Set endpoint byte: For control transfers (ep0), usbfs wants endpoint=0
+               (direction is embedded in the setup packet). For others, set 0x80 for IN. */
             if (urb->type == USBDEVFS_URB_TYPE_CONTROL) {
-                // For control transfers, setup packet is prefixed to data buffer in Linux kernel struct usbdevfs_urb
-                void* ctrl_buf = malloc(8 + buffer_len);
-                memcpy(ctrl_buf, cmd_sub.setup, 8);
-                if (buffer) {
-                    memcpy(ctrl_buf + 8, buffer, data_wire_len);
+                urb->endpoint = 0;
+            } else {
+                urb->endpoint = ep_num & 0xFF;
+                if (!is_out) urb->endpoint |= 0x80;
+            }
+
+            /* Build the data buffer */
+            if (urb->type == USBDEVFS_URB_TYPE_CONTROL) {
+                /* usbfs control: 8-byte setup packet prepended to data buffer */
+                void* ctrl = malloc(8 + buf_len);
+                if (!ctrl) {
+                    if (buffer) free(buffer);
+                    free(ctx);
+                    break;
+                }
+                memcpy(ctrl, sub.setup, 8);
+                if (buffer && data_wire > 0) {
+                    memcpy(ctrl + 8, buffer, data_wire);
                     free(buffer);
                 }
-                ctx->buffer = ctrl_buf;
-                urb->buffer = ctrl_buf;
-                urb->buffer_length = 8 + buffer_len;
+                ctx->buffer = ctrl;
+                urb->buffer = ctrl;
+                urb->buffer_length = 8 + buf_len;
             } else {
-                if (!buffer && buffer_len > 0) {
-                    buffer = calloc(1, buffer_len);
+                /* For IN: allocate receive buffer if needed */
+                if (!buffer && buf_len > 0) {
+                    buffer = calloc(1, buf_len);
+                    if (!buffer) { free(ctx); break; }
                 }
                 ctx->buffer = buffer;
                 urb->buffer = buffer;
-                urb->buffer_length = buffer_len;
+                urb->buffer_length = buf_len;
             }
-            
-            urb->start_frame = ntohl(cmd_sub.start_frame);
-            urb->number_of_packets = num_packets;
-            urb->usercontext = ctx;
 
-            add_urb_context(ctx);
+            urb->start_frame     = (num_iso > 0) ? 0 : 0; /* let kernel pick */
+            urb->number_of_packets = num_iso;
+            urb->usercontext     = ctx;
+
+            /* For ISO, set ASAP flag so kernel schedules immediately */
+            if (urb->type == USBDEVFS_URB_TYPE_ISO) {
+                urb->flags = USBDEVFS_URB_ISO_ASAP;
+            }
+
+            add_urb(cs, ctx);
 
             int res = ioctl(usbFd, USBDEVFS_SUBMITURB, urb);
             if (res < 0) {
-                // If submit fails immediately, we can fake a reap to unblock network or handle directly
+                /* Submit failed: remove from list and send error reply immediately */
+                remove_urb(cs, ctx);
+                send_submit_error(cs, ctx, -errno);
+                if (ctx->buffer) free(ctx->buffer);
+                free(ctx);
             }
 
-        } else if (cmd_type == 0x00000002) { // USBIP_CMD_UNLINK
-            struct usbip_header_cmd_unlink cmd_un;
-            cmd_un.base = base_cmd;
-            ssize_t rem = recv(tcpSocketFd, ((uint8_t*)&cmd_un) + 20, 28, MSG_WAITALL);
-            if (rem <= 0) break;
-            
-            struct urb_context* target_ctx = find_urb_context_by_seqnum(cmd_un.unlink_seqnum);
-            if (target_ctx) {
-                ioctl(usbFd, USBDEVFS_DISCARDURB, &target_ctx->urb);
+        } else if (cmd == 0x00000002) { /* USBIP_CMD_UNLINK */
+            struct usbip_header_cmd_unlink unl;
+            unl.base = base;
+            if (recv_all(tcpSocketFd, ((uint8_t*)&unl) + 20, 28) < 0) break;
+
+            /* unlink_seqnum is in network byte order on the wire */
+            struct urb_context* target = find_urb_by_seqnum(cs, unl.unlink_seqnum);
+            if (target) {
+                ioctl(usbFd, USBDEVFS_DISCARDURB, &target->urb);
+                /* The reaper thread will see the discarded URB and send RET_SUBMIT
+                   with status -ECONNRESET. We still need to send RET_UNLINK. */
             }
-            
-            // Note: The Reaper thread will see the discarded URB (status -ENOENT) 
-            // and send RET_SUBMIT. Then the client knows it actually unlinked.
-            // We also must send RET_UNLINK for the unlink command itself.
-            struct usbip_header_ret_unlink ret_un;
-            memset(&ret_un, 0, sizeof(ret_un));
-            ret_un.base.command = htonl(0x00000004); // RET_UNLINK
-            ret_un.base.seqnum = cmd_un.base.seqnum;
-            ret_un.base.devid = cmd_un.base.devid;
-            ret_un.base.direction = cmd_un.base.direction;
-            ret_un.base.ep = cmd_un.base.ep;
-            ret_un.status = htonl(target_ctx ? 0 : -ENOENT);
-            
-            send(tcpSocketFd, &ret_un, sizeof(ret_un), MSG_NOSIGNAL);
+
+            struct usbip_header_ret_unlink ret;
+            memset(&ret, 0, sizeof(ret));
+            ret.base.command   = htonl(0x00000004);
+            ret.base.seqnum    = unl.base.seqnum;
+            ret.base.devid     = unl.base.devid;
+            ret.base.direction = unl.base.direction;
+            ret.base.ep        = unl.base.ep;
+            ret.status = htonl(target ? -ECONNRESET : -ENOENT);
+
+            send_all(cs->tcpFd, &ret, sizeof(ret), &cs->send_mutex);
+
         } else {
-            // Unknown command, connection corrupted?
-            break;
+            break; /* Unknown command */
         }
     }
-    
-    // Close sockets forcefully so reaper thread terminates.
-    // Memory leak on exit is acceptable per thread shutdown logic for detached state.
+
+    /* Shutdown: signal reaper, then unblock its blocking REAPURB ioctl.
+     * We do NOT close usbFd here - Java manages the USB connection lifecycle.
+     * Instead, submit a DISCARDURB for any outstanding URBs and use
+     * ioctl(USBDEVFS_DISCARDURB) to wake the reaper. */
+    cs->running = 0;
     shutdown(tcpSocketFd, SHUT_RDWR);
-    pthread_detach(reaper);
-    
+
+    /* Discard all outstanding URBs so the reaper's REAPURB unblocks */
+    pthread_mutex_lock(&cs->urb_mutex);
+    struct urb_context* u = cs->active_urbs;
+    while (u) {
+        ioctl(usbFd, USBDEVFS_DISCARDURB, &u->urb);
+        u = u->next;
+    }
+    pthread_mutex_unlock(&cs->urb_mutex);
+
+    pthread_join(reaper, NULL);
+
+    /* Free any remaining URBs */
+    struct urb_context* c = cs->active_urbs;
+    while (c) {
+        struct urb_context* next = c->next;
+        if (c->buffer) free(c->buffer);
+        free(c);
+        c = next;
+    }
+
+    pthread_mutex_destroy(&cs->send_mutex);
+    pthread_mutex_destroy(&cs->urb_mutex);
+    free(cs);
+
     return 0;
 }
