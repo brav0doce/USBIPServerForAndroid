@@ -704,14 +704,19 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
             if (recv_all(tcpSocketFd, ((uint8_t*)&sub) + 20, 28) < 0) break;
 
             int is_out     = (ntohl(sub.base.direction) == 0);
+            uint32_t transfer_flags = ntohl(sub.transfer_flags);
             int32_t buf_len = (int32_t)ntohl(sub.transfer_buffer_length);
+            int32_t start_frame = (int32_t)ntohl(sub.start_frame);
             int num_iso    = (int32_t)ntohl(sub.number_of_packets);
+            int32_t interval = (int32_t)ntohl(sub.interval);
             uint32_t ep_num = ntohl(sub.base.ep);
 
             /* Sanity: limit buffer size */
             if (buf_len < 0) buf_len = 0;
             if (buf_len > 16 * 1024 * 1024) { break; }
             if (num_iso < 0) num_iso = 0;
+            if (start_frame < 0) start_frame = 0;
+            if (interval < 0) interval = 0;
 
             int data_wire  = is_out ? buf_len : 0;
             int iso_wire   = num_iso * (int)sizeof(struct usbip_iso_packet_descriptor);
@@ -878,13 +883,24 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 urb->buffer_length = buf_len;
             }
 
-            urb->start_frame     = (num_iso > 0) ? 0 : 0; /* let kernel pick */
+            /* Respect host scheduling parameters for periodic transfers. */
+            urb->start_frame     = start_frame;
             urb->number_of_packets = num_iso;
+            urb->interval        = interval;
             urb->usercontext     = ctx;
 
-            /* For ISO, set ASAP flag so kernel schedules immediately */
+            urb->flags = transfer_flags &
+                    (USBDEVFS_URB_SHORT_NOT_OK | USBDEVFS_URB_ZERO_PACKET | USBDEVFS_URB_NO_INTERRUPT);
+
+            /* Preserve previous behavior when host does not request an explicit start frame. */
             if (urb->type == USBDEVFS_URB_TYPE_ISO) {
-                urb->flags = USBDEVFS_URB_ISO_ASAP;
+                if ((transfer_flags & USBDEVFS_URB_ISO_ASAP) || start_frame == 0) {
+                    urb->flags |= USBDEVFS_URB_ISO_ASAP;
+                }
+                if (urb->interval <= 0) {
+                    /* Some audio devices reject ISO URBs with interval 0. */
+                    urb->interval = 1;
+                }
             }
 
             add_urb(cs, ctx);
