@@ -880,26 +880,36 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 }
                 ctx->buffer = buffer;
                 urb->buffer = buffer;
-                urb->buffer_length = buf_len;
+                
+                if (urb->type == USBDEVFS_URB_TYPE_ISO) {
+                    uint32_t iso_sum = 0;
+                    for (int i = 0; i < num_iso; i++) {
+                        iso_sum += urb->iso_frame_desc[i].length;
+                    }
+                    /* Linux usbfs strictly validates buffer_length against the sum of descriptor lengths */
+                    urb->buffer_length = iso_sum;
+                } else {
+                    urb->buffer_length = buf_len;
+                }
             }
 
             /* Respect host scheduling parameters for periodic transfers. */
             urb->start_frame     = start_frame;
             urb->number_of_packets = num_iso;
-            urb->interval        = interval;
             urb->usercontext     = ctx;
 
-            urb->flags = transfer_flags &
-                    (USBDEVFS_URB_SHORT_NOT_OK | USBDEVFS_URB_ZERO_PACKET | USBDEVFS_URB_NO_INTERRUPT);
+            urb->flags = transfer_flags & USBDEVFS_URB_SHORT_NOT_OK;
+#ifdef USBDEVFS_URB_ZERO_PACKET
+            urb->flags |= (transfer_flags & USBDEVFS_URB_ZERO_PACKET);
+#endif
+#ifdef USBDEVFS_URB_NO_INTERRUPT
+            urb->flags |= (transfer_flags & USBDEVFS_URB_NO_INTERRUPT);
+#endif
 
             /* Preserve previous behavior when host does not request an explicit start frame. */
             if (urb->type == USBDEVFS_URB_TYPE_ISO) {
                 if ((transfer_flags & USBDEVFS_URB_ISO_ASAP) || start_frame == 0) {
                     urb->flags |= USBDEVFS_URB_ISO_ASAP;
-                }
-                if (urb->interval <= 0) {
-                    /* Some audio devices reject ISO URBs with interval 0. */
-                    urb->interval = 1;
                 }
             }
 
