@@ -898,11 +898,20 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 			return;
 		}
 
+		// Claim the selected active interfaces
 		for (int i = 0; i < context.activeInterfacesById.size(); i++) {
 			UsbInterface iface = context.activeInterfacesById.valueAt(i);
 			if (!context.devConn.claimInterface(iface, true)) {
 				System.err.println("Unable to claim interface: " + iface.getId() + "; endpoint traffic on this interface may fail.");
 			}
+		}
+
+		// Also try to claim all available interfaces on the device to avoid SET_INTERFACE issues
+		// where Windows switches to an alternate setting that wasn't claimed.
+		for (int i = 0; i < context.device.getInterfaceCount(); i++) {
+			UsbInterface iface = context.device.getInterface(i);
+			// We might claim it again if it was active, but claimInterface is safe to call repeatedly for the same interface
+			context.devConn.claimInterface(iface, true);
 		}
 	}
 

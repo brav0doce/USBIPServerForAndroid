@@ -201,12 +201,17 @@ public class UsbControlHelper {
 						if (deviceContext.activeInterfacesById == null) {
 							deviceContext.activeInterfacesById = new SparseArray<>();
 						}
+						
+						// Do NOT release the previous interface before setting this one! 
+						// Releasing the interface cancels pending URBs in usbfs and breaks SET_INTERFACE on Android.
+						// We already claimed it, or we simply claim it along with others.
 						UsbInterface previousIface = deviceContext.activeInterfacesById.get(index);
 						if (previousIface != null && previousIface != iface) {
-							deviceContext.devConn.releaseInterface(previousIface);
+							// deviceContext.devConn.releaseInterface(previousIface);
 						}
 
 						deviceContext.activeInterfacesById.put(index, iface);
+						// claimInterface is benign if already claimed, but helps if it was somehow skipped.
 						if (!deviceContext.devConn.claimInterface(iface, true)) {
 							System.err.println("Unable to claim interface: "+iface.getId());
 						}
