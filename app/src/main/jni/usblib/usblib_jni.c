@@ -343,7 +343,7 @@ static void* reaper(void* arg){
         while(c->running){
             struct usbdevfs_urb* rp=NULL;
             int res=ioctl(c->usbFd,USBDEVFS_REAPURBNDELAY,&rp);
-            if(res<0){if(errno==EAGAIN)break;if(errno==ENODEV){c->running=0;goto done;}if(errno==EINTR)continue;break;}
+            if(res<0){if(errno==EAGAIN)break;if(errno==ENODEV){c->running=0;goto done;}if(errno==EINTR)continue;continue;}
             if(!rp)break;
             struct urb_ctx* x=(struct urb_ctx*)rp->usercontext;
             if(!x)continue;
@@ -524,11 +524,18 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
 #ifdef USBDEVFS_URB_NO_INTERRUPT
             urb->flags|=(tf&USBDEVFS_URB_NO_INTERRUPT);
 #endif
-            if(utype==USBDEVFS_URB_TYPE_ISO&&((tf&USBDEVFS_URB_ISO_ASAP)||sf==0))
-                urb->flags|=USBDEVFS_URB_ISO_ASAP;
+            if(utype==USBDEVFS_URB_TYPE_ISO)
+                urb->flags|=USBDEVFS_URB_ISO_ASAP; /* Force ASAP for network delay */
 
             add_u(cs,x);
             int res=ioctl(usbFd,USBDEVFS_SUBMITURB,urb);
+            
+            /* Fallback to BULK if INTERRUPT rejected, and vice-versa */
+            if(res<0 && errno==EINVAL) {
+                if(utype==USBDEVFS_URB_TYPE_INTERRUPT) { urb->type=USBDEVFS_URB_TYPE_BULK; res=ioctl(usbFd,USBDEVFS_SUBMITURB,urb); }
+                else if(utype==USBDEVFS_URB_TYPE_BULK) { urb->type=USBDEVFS_URB_TYPE_INTERRUPT; res=ioctl(usbFd,USBDEVFS_SUBMITURB,urb); }
+            }
+            
             if(res<0){
                 int err=errno; del_u(cs,x);
                 errrep(cs,x,-err);

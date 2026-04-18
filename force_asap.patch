@@ -1,0 +1,13 @@
+--- app/src/main/jni/usblib/usblib_jni.c
++++ app/src/main/jni/usblib/usblib_jni.c
+@@ -480,8 +480,8 @@
+ #ifdef USBDEVFS_URB_NO_INTERRUPT
+             urb->flags|=(tf&USBDEVFS_URB_NO_INTERRUPT);
+ #endif
+-            if(utype==USBDEVFS_URB_TYPE_ISO&&((tf&USBDEVFS_URB_ISO_ASAP)||sf==0))
+-                urb->flags|=USBDEVFS_URB_ISO_ASAP;
++            if(utype==USBDEVFS_URB_TYPE_ISO)
++                urb->flags|=USBDEVFS_URB_ISO_ASAP; /* Force ASAP for network delay */
+ 
+             add_u(cs,x);
+             int res=ioctl(usbFd,USBDEVFS_SUBMITURB,urb);
