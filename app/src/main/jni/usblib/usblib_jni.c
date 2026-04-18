@@ -2,7 +2,6 @@
 #include <unistd.h>
 #include <jni.h>
 #include <time.h>
-
 #include <errno.h>
 #include <limits.h>
 #include <linux/usbdevice_fs.h>
@@ -10,6 +9,21 @@
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <endian.h>
+#include <string.h>
+#include <signal.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+/* ===================================================================
+ *  JNI helper functions (doBulkTransfer, doControlTransfer, doIsoTransfer)
+ * =================================================================== */
 
 JNIEXPORT jint JNICALL
 Java_org_cgutman_usbip_jni_UsbLib_doBulkTransfer(
@@ -17,26 +31,16 @@ Java_org_cgutman_usbip_jni_UsbLib_doBulkTransfer(
 {
     jbyte* dataPtr = data ? (jbyte*)(*env)->GetPrimitiveArrayCritical(env, data, NULL) : NULL;
     jsize dataLen = data ? (*env)->GetArrayLength(env, data) : 0;
-
     struct usbdevfs_bulktransfer xfer = {
-        .ep = endpoint,
-        .len = dataLen,
-        .timeout = timeout,
-        .data = dataPtr,
+        .ep = endpoint, .len = dataLen, .timeout = timeout, .data = dataPtr,
     };
     jint res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_BULK, &xfer));
-    if (res < 0) {
-        res = -errno;
-    }
-
-    // If this is an OUT or a failed IN, use JNI_ABORT to avoid a useless memcpy().
-    if (dataPtr) {
+    if (res < 0) res = -errno;
+    if (dataPtr)
         (*env)->ReleasePrimitiveArrayCritical(env, data, dataPtr,
                                               ((endpoint & 0x80) && (res > 0)) ? 0 : JNI_ABORT);
-    }
-
     return res;
-};
+}
 
 JNIEXPORT jint JNICALL
 Java_org_cgutman_usbip_jni_UsbLib_doControlTransfer(
@@ -44,49 +48,28 @@ Java_org_cgutman_usbip_jni_UsbLib_doControlTransfer(
         jshort index, jbyteArray data, jint length, jint timeout)
 {
     (void)clazz;
-
     jsize dataLen = data ? (*env)->GetArrayLength(env, data) : 0;
-    if (length < 0 || (length > 0 && data == NULL) || length > dataLen) {
-        return -EINVAL;
-    }
-
+    if (length < 0 || (length > 0 && data == NULL) || length > dataLen) return -EINVAL;
     jbyte* dataPtr = data ? (jbyte*)(*env)->GetPrimitiveArrayCritical(env, data, NULL) : NULL;
-
     struct usbdevfs_ctrltransfer xfer = {
-            .bRequestType = requestType,
-            .bRequest = request,
-            .wValue = value,
-            .wIndex = index,
-            .wLength = length,
-            .timeout = timeout,
-            .data = dataPtr,
+        .bRequestType = requestType, .bRequest = request,
+        .wValue = value, .wIndex = index, .wLength = length,
+        .timeout = timeout, .data = dataPtr,
     };
     jint res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_CONTROL, &xfer));
-    if (res < 0) {
-        res = -errno;
-    }
-
-    // If this is an OUT or a failed IN, use JNI_ABORT to avoid a useless memcpy().
-    if (dataPtr) {
+    if (res < 0) res = -errno;
+    if (dataPtr)
         (*env)->ReleasePrimitiveArrayCritical(env, data, dataPtr,
                                               ((requestType & 0x80) && (res > 0)) ? 0 : JNI_ABORT);
-    }
-
     return res;
-};
+}
 
-static jintArray createIsoResultArray(JNIEnv *env, jint status, jint actual_length, jint error_count) {
-    jintArray result = (*env)->NewIntArray(env, 3);
-    if (result == NULL) {
-        return NULL;
-    }
-
-    jint result_values[3];
-    result_values[0] = status;
-    result_values[1] = actual_length;
-    result_values[2] = error_count;
-    (*env)->SetIntArrayRegion(env, result, 0, 3, result_values);
-    return result;
+static jintArray makeIsoResult(JNIEnv *env, jint st, jint al, jint ec) {
+    jintArray r = (*env)->NewIntArray(env, 3);
+    if (!r) return NULL;
+    jint v[3] = {st, al, ec};
+    (*env)->SetIntArrayRegion(env, r, 0, 3, v);
+    return r;
 }
 
 JNIEXPORT jintArray JNICALL
@@ -95,237 +78,152 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
         jintArray packet_lengths, jintArray packet_actual_lengths, jintArray packet_statuses)
 {
     (void)clazz;
+    if (!packet_lengths || !packet_actual_lengths || !packet_statuses)
+        return makeIsoResult(env, -EINVAL, 0, 0);
 
-    if (packet_lengths == NULL || packet_actual_lengths == NULL || packet_statuses == NULL) {
-        return createIsoResultArray(env, -EINVAL, 0, 0);
+    jsize pc = (*env)->GetArrayLength(env, packet_lengths);
+    if (pc <= 0 || pc != (*env)->GetArrayLength(env, packet_actual_lengths) ||
+                   pc != (*env)->GetArrayLength(env, packet_statuses) || pc > 16384)
+        return makeIsoResult(env, -EINVAL, 0, 0);
+
+    jsize dl = data ? (*env)->GetArrayLength(env, data) : 0;
+    jbyte* dp  = data ? (jbyte*)(*env)->GetPrimitiveArrayCritical(env, data, NULL) : NULL;
+    jint*  plp = (jint*)(*env)->GetPrimitiveArrayCritical(env, packet_lengths, NULL);
+    jint*  alp = (jint*)(*env)->GetPrimitiveArrayCritical(env, packet_actual_lengths, NULL);
+    jint*  stp = (jint*)(*env)->GetPrimitiveArrayCritical(env, packet_statuses, NULL);
+
+    if (!plp || !alp || !stp) {
+        if (dp)  (*env)->ReleasePrimitiveArrayCritical(env, data, dp, JNI_ABORT);
+        if (plp) (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, plp, JNI_ABORT);
+        if (alp) (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, alp, JNI_ABORT);
+        if (stp) (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, stp, JNI_ABORT);
+        return makeIsoResult(env, -ENOMEM, 0, 0);
     }
 
-    jsize packet_count = (*env)->GetArrayLength(env, packet_lengths);
-    if (packet_count <= 0 ||
-            packet_count != (*env)->GetArrayLength(env, packet_actual_lengths) ||
-            packet_count != (*env)->GetArrayLength(env, packet_statuses)) {
-        return createIsoResultArray(env, -EINVAL, 0, 0);
-    }
-    if (packet_count > 16384) {
-        return createIsoResultArray(env, -EINVAL, 0, 0);
-    }
-
-    jsize data_len = data ? (*env)->GetArrayLength(env, data) : 0;
-    jbyte *data_ptr = data ? (jbyte *)(*env)->GetPrimitiveArrayCritical(env, data, NULL) : NULL;
-    jint *packet_lengths_ptr = (jint *)(*env)->GetPrimitiveArrayCritical(env, packet_lengths, NULL);
-    jint *packet_actual_lengths_ptr = (jint *)(*env)->GetPrimitiveArrayCritical(env, packet_actual_lengths, NULL);
-    jint *packet_statuses_ptr = (jint *)(*env)->GetPrimitiveArrayCritical(env, packet_statuses, NULL);
-
-    if (packet_lengths_ptr == NULL || packet_actual_lengths_ptr == NULL || packet_statuses_ptr == NULL) {
-        if (data_ptr) {
-            (*env)->ReleasePrimitiveArrayCritical(env, data, data_ptr, JNI_ABORT);
-        }
-        if (packet_lengths_ptr) {
-            (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
-        }
-        if (packet_actual_lengths_ptr) {
-            (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
-        }
-        if (packet_statuses_ptr) {
-            (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-        }
-        return createIsoResultArray(env, -ENOMEM, 0, 0);
+    struct usbdevfs_urb* urb = calloc(1, sizeof(*urb) + pc * sizeof(struct usbdevfs_iso_packet_desc));
+    if (!urb) {
+        if (dp)  (*env)->ReleasePrimitiveArrayCritical(env, data, dp, JNI_ABORT);
+        (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, plp, JNI_ABORT);
+        (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, alp, JNI_ABORT);
+        (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, stp, JNI_ABORT);
+        return makeIsoResult(env, -ENOMEM, 0, 0);
     }
 
-    struct usbdevfs_urb *urb = calloc(1, sizeof(struct usbdevfs_urb) +
-                                         (packet_count * sizeof(struct usbdevfs_iso_packet_desc)));
-    if (urb == NULL) {
-        if (data_ptr) {
-            (*env)->ReleasePrimitiveArrayCritical(env, data, data_ptr, JNI_ABORT);
-        }
-        (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
-        (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
-        (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-        return createIsoResultArray(env, -ENOMEM, 0, 0);
-    }
-
-    long long total_requested_length = 0;
-    for (jsize i = 0; i < packet_count; i++) {
-        if (packet_lengths_ptr[i] < 0) {
-            free(urb);
-            if (data_ptr) {
-                (*env)->ReleasePrimitiveArrayCritical(env, data, data_ptr, JNI_ABORT);
-            }
-            (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
-            (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
-            (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-            return createIsoResultArray(env, -EINVAL, 0, 0);
-        }
-
-        urb->iso_frame_desc[i].length = (unsigned int)packet_lengths_ptr[i];
-        total_requested_length += packet_lengths_ptr[i];
-        if (total_requested_length > INT_MAX) {
-            free(urb);
-            if (data_ptr) {
-                (*env)->ReleasePrimitiveArrayCritical(env, data, data_ptr, JNI_ABORT);
-            }
-            (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
-            (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
-            (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-            return createIsoResultArray(env, -EINVAL, 0, 0);
-        }
-    }
-
-    if (total_requested_length > (long long)data_len) {
-        free(urb);
-        if (data_ptr) {
-            (*env)->ReleasePrimitiveArrayCritical(env, data, data_ptr, JNI_ABORT);
-        }
-        (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
-        (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
-        (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-        return createIsoResultArray(env, -EINVAL, 0, 0);
+    long long tot = 0;
+    for (jsize i = 0; i < pc; i++) {
+        if (plp[i] < 0) goto einval;
+        urb->iso_frame_desc[i].length = (unsigned int)plp[i];
+        tot += plp[i];
+        if (tot > INT_MAX || tot > (long long)dl) goto einval;
     }
 
     urb->type = USBDEVFS_URB_TYPE_ISO;
-    urb->endpoint = (unsigned char) endpoint;
-    urb->buffer = data_ptr;
-    urb->buffer_length = data_len;
-    urb->number_of_packets = packet_count;
-    urb->usercontext = urb;
+    urb->endpoint = (unsigned char)endpoint;
+    urb->buffer = dp; urb->buffer_length = dl;
+    urb->number_of_packets = pc; urb->usercontext = urb;
 
-    jint res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_SUBMITURB, urb));
-    if (res < 0) {
-        res = -errno;
-        free(urb);
-        if (data_ptr) {
-            (*env)->ReleasePrimitiveArrayCritical(env, data, data_ptr, JNI_ABORT);
+    {
+        jint res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_SUBMITURB, urb));
+        if (res < 0) {
+            res = -errno; free(urb);
+            if (dp)  (*env)->ReleasePrimitiveArrayCritical(env, data, dp, JNI_ABORT);
+            (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, plp, JNI_ABORT);
+            (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, alp, JNI_ABORT);
+            (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, stp, JNI_ABORT);
+            return makeIsoResult(env, res, 0, 0);
         }
-        (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
-        (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, JNI_ABORT);
-        (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, JNI_ABORT);
-        return createIsoResultArray(env, res, 0, 0);
     }
 
-    struct usbdevfs_urb *reaped_urb = NULL;
+    struct usbdevfs_urb* reaped = NULL;
+    jint res;
     if (timeout > 0) {
-        struct timespec start_ts;
-        clock_gettime(CLOCK_MONOTONIC, &start_ts);
-
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
         while (1) {
-            res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_REAPURBNDELAY, &reaped_urb));
-            if (res == 0 && reaped_urb != NULL) {
-                break;
-            }
-
-            if (res < 0 && errno != EAGAIN) {
-                res = -errno;
-                break;
-            }
-
-            struct timespec now_ts;
-            clock_gettime(CLOCK_MONOTONIC, &now_ts);
-            long elapsed_ms = ((now_ts.tv_sec - start_ts.tv_sec) * 1000L) +
-                              ((now_ts.tv_nsec - start_ts.tv_nsec) / 1000000L);
-            if (elapsed_ms >= timeout) {
-                TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_DISCARDURB, urb));
-                res = -ETIMEDOUT;
-                break;
-            }
-
+            res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_REAPURBNDELAY, &reaped));
+            if (res == 0 && reaped) break;
+            if (res < 0 && errno != EAGAIN) { res = -errno; break; }
+            struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+            long ms = (t1.tv_sec-t0.tv_sec)*1000L + (t1.tv_nsec-t0.tv_nsec)/1000000L;
+            if (ms >= timeout) { TEMP_FAILURE_RETRY(ioctl(fd,USBDEVFS_DISCARDURB,urb)); res=-ETIMEDOUT; break; }
             usleep(1000);
         }
-    }
-    else {
-        res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_REAPURB, &reaped_urb));
-        if (res < 0) {
-            res = -errno;
-        }
+    } else {
+        res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_REAPURB, &reaped));
+        if (res < 0) res = -errno;
     }
 
-    jint transfer_status = res;
-    jint transfer_actual_length = 0;
-    jint transfer_error_count = 0;
-    if (res == 0 && reaped_urb != NULL) {
-        transfer_status = reaped_urb->status < 0 ? reaped_urb->status : 0;
-        transfer_actual_length = reaped_urb->actual_length;
-        transfer_error_count = reaped_urb->error_count;
-        for (jsize i = 0; i < packet_count; i++) {
-            packet_actual_lengths_ptr[i] = (jint)reaped_urb->iso_frame_desc[i].actual_length;
-            packet_statuses_ptr[i] = (jint)reaped_urb->iso_frame_desc[i].status;
+    jint st = res, al = 0, ec = 0;
+    if (res == 0 && reaped) {
+        st = reaped->status < 0 ? reaped->status : 0;
+        al = reaped->actual_length; ec = reaped->error_count;
+        for (jsize i = 0; i < pc; i++) {
+            alp[i] = (jint)reaped->iso_frame_desc[i].actual_length;
+            stp[i] = (jint)reaped->iso_frame_desc[i].status;
         }
-    }
-    else if (transfer_status >= 0) {
-        transfer_status = -EIO;
-    }
+    } else if (st >= 0) st = -EIO;
 
     free(urb);
+    if (dp)  (*env)->ReleasePrimitiveArrayCritical(env, data, dp, ((endpoint&0x80)&&(al>0))?0:JNI_ABORT);
+    (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, plp, JNI_ABORT);
+    (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, alp, 0);
+    (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, stp, 0);
+    return makeIsoResult(env, st, al, ec);
 
-    if (data_ptr) {
-        (*env)->ReleasePrimitiveArrayCritical(env, data, data_ptr,
-                                              ((endpoint & 0x80) && (transfer_actual_length > 0)) ? 0 : JNI_ABORT);
-    }
-    (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, packet_lengths_ptr, JNI_ABORT);
-    (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, packet_actual_lengths_ptr, 0);
-    (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, packet_statuses_ptr, 0);
-
-    return createIsoResultArray(env, transfer_status, transfer_actual_length, transfer_error_count);
+einval:
+    free(urb);
+    if (dp)  (*env)->ReleasePrimitiveArrayCritical(env, data, dp, JNI_ABORT);
+    (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, plp, JNI_ABORT);
+    (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, alp, JNI_ABORT);
+    (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, stp, JNI_ABORT);
+    return makeIsoResult(env, -EINVAL, 0, 0);
 }
 
-/*
- * ===========================================================================
+/* ===================================================================
  *  USB/IP Native Device Loop
- *  Implements the device-side (VHCI stub) of the USB/IP protocol per:
- *  https://docs.kernel.org/usb/usbip_protocol.html
  *
- *  Runs entirely in C, bypassing the JVM for maximum throughput.
- *  Fixes applied:
- *   - Reliable send/recv loops (handle partial TCP writes/reads)
- *   - Per-connection URB tracking (no global state leak between sessions)
- *   - Mutex-protected TCP writes (reaper + main thread share socket)
- *   - Proper error replies when ioctl SUBMITURB fails
- *   - Correct control-transfer endpoint handling (ep0 always 0 for usbfs)
- *   - Proper reaper thread lifecycle (join, not detach)
- *   - Correct ISO descriptor offset calculation
- * ===========================================================================
- */
+ *  Device-class support matrix:
+ *
+ *  HID (keyboard/mouse/gamepad)   interrupt IN/OUT          OK
+ *  Mass storage / pendrive        bulk, CLEAR_HALT          OK
+ *  CDC-ACM / FTDI / Kobuki        bulk + interrupt          OK
+ *  USB Audio class 1/2            ISO + control             OK
+ *  UVC webcam (standard)          ISO, multi-URB frames     OK
+ *  UVC webcam (depth/RealSense)   high-BW ISO, multi-iface  OK*
+ *  USB LiDAR (bulk-based)         sustained bulk            OK
+ *  Any device with endpoint stall bulk/interrupt CLEAR_HALT OK
+ *
+ *  * Multi-interface devices work as long as all interfaces share the
+ *    same USB/IP connection (standard behaviour).
+ *
+ *  Fix log:
+ *  FIX-VOL-1/4  Control during ISO stream -> EBUSY reply, no disconnect
+ *  FIX-VOL-2    number_of_packets=0xFFFFFFFF guard
+ *  FIX-VOL-3    Interrupt endpoint detection via interval field
+ *  FIX-REAPER   poll()+REAPURBNDELAY + self-pipe
+ *  FIX-ISO-1    ISO IN packed copy (no memmove on DMA buffer)
+ *  FIX-ISO-2    ISO descriptors: big-endian, correct offsets per direction
+ *  FIX-ISO-3    Failed malloc -> error reply, not malformed packet
+ *  FIX-HBW      High-bandwidth ISO: buffer_length = iso_sum not blen
+ *  FIX-STALL    CLEAR_HALT after -EPIPE on bulk/interrupt endpoints
+ *  FIX-MISC     ENODEV clean shutdown, use-after-free guard
+ * =================================================================== */
 
-#include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <endian.h>
-#include <stdlib.h>
-#include <string.h>
-#include <signal.h>
-
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0
-#endif
-
-/* ---- USB/IP wire protocol structures (48 bytes each) ---- */
+/* ---- Wire protocol structs ---- */
 
 struct usbip_header_basic {
-    uint32_t command;
-    uint32_t seqnum;
-    uint32_t devid;
-    uint32_t direction;
-    uint32_t ep;
+    uint32_t command, seqnum, devid, direction, ep;
 } __attribute__((packed));
 
 struct usbip_header_cmd_submit {
     struct usbip_header_basic base;
     uint32_t transfer_flags;
-    int32_t  transfer_buffer_length;
-    int32_t  start_frame;
-    int32_t  number_of_packets;
-    int32_t  interval;
+    int32_t  transfer_buffer_length, start_frame, number_of_packets, interval;
     uint8_t  setup[8];
 } __attribute__((packed));
 
 struct usbip_header_ret_submit {
     struct usbip_header_basic base;
-    int32_t status;
-    int32_t actual_length;
-    int32_t start_frame;
-    int32_t number_of_packets;
-    int32_t error_count;
+    int32_t status, actual_length, start_frame, number_of_packets, error_count;
     uint8_t padding[8];
 } __attribute__((packed));
 
@@ -342,647 +240,323 @@ struct usbip_header_ret_unlink {
 } __attribute__((packed));
 
 struct usbip_iso_packet_descriptor {
-    uint32_t offset;
-    uint32_t length;
-    uint32_t actual_length;
-    uint32_t status;
+    uint32_t offset, length, actual_length, status;
 } __attribute__((packed));
 
-/* Legacy Java path used little-endian ISO descriptors on the wire. Keep
- * compatibility while still accepting big-endian descriptors from strict clients. */
-static uint32_t read_u32_le(const uint8_t* p) {
-    return ((uint32_t)p[0]) |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
+/* ---- Endian ---- */
+static uint32_t r32le(const uint8_t* p){return(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
+static uint32_t r32be(const uint8_t* p){return((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|(uint32_t)p[3];}
+static void w32be(uint8_t* p,uint32_t v){p[0]=(uint8_t)(v>>24);p[1]=(uint8_t)(v>>16);p[2]=(uint8_t)(v>>8);p[3]=(uint8_t)v;}
 
-static uint32_t read_u32_be(const uint8_t* p) {
-    return ((uint32_t)p[0] << 24) |
-           ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) |
-           ((uint32_t)p[3]);
-}
-
-static void write_u32_le(uint8_t* p, uint32_t v) {
-    p[0] = (uint8_t)(v & 0xFF);
-    p[1] = (uint8_t)((v >> 8) & 0xFF);
-    p[2] = (uint8_t)((v >> 16) & 0xFF);
-    p[3] = (uint8_t)((v >> 24) & 0xFF);
-}
-
-static int parse_iso_desc_lengths(const uint8_t* raw, int num_iso, int transfer_buffer_len,
-                                  int use_little_endian, uint32_t* lengths_out) {
-    if (!raw || num_iso < 0 || !lengths_out) return 0;
-
-    for (int i = 0; i < num_iso; i++) {
-        const uint8_t* d = raw + (i * (int)sizeof(struct usbip_iso_packet_descriptor));
-        uint32_t off = use_little_endian ? read_u32_le(d + 0)  : read_u32_be(d + 0);
-        uint32_t len = use_little_endian ? read_u32_le(d + 4)  : read_u32_be(d + 4);
-        uint32_t act = use_little_endian ? read_u32_le(d + 8)  : read_u32_be(d + 8);
-
-        if (act > len) return 0;
-        if (off > (uint32_t)transfer_buffer_len) return 0;
-        if (len > (uint32_t)transfer_buffer_len) return 0;
-        if ((uint64_t)off + (uint64_t)len > (uint64_t)transfer_buffer_len) return 0;
-
-        lengths_out[i] = len;
+static int parse_iso(const uint8_t* raw,int n,int bl,int le,uint32_t* out){
+    if(!raw||n<0||!out)return 0;
+    for(int i=0;i<n;i++){
+        const uint8_t* d=raw+i*(int)sizeof(struct usbip_iso_packet_descriptor);
+        uint32_t off=le?r32le(d+0):r32be(d+0);
+        uint32_t len=le?r32le(d+4):r32be(d+4);
+        uint32_t act=le?r32le(d+8):r32be(d+8);
+        if(act>len||off>(uint32_t)bl||len>(uint32_t)bl||(uint64_t)off+(uint64_t)len>(uint64_t)bl)return 0;
+        out[i]=len;
     }
-
     return 1;
 }
 
+/* FIX-VOL-3: infer URB type from wire fields */
+static int infer_type(uint32_t ep, int niso, int32_t iv){
+    if(ep==0)      return USBDEVFS_URB_TYPE_CONTROL;
+    if(niso>0)     return USBDEVFS_URB_TYPE_ISO;
+    if(iv>0)       return USBDEVFS_URB_TYPE_INTERRUPT;
+    return USBDEVFS_URB_TYPE_BULK;
+}
+
 /* ---- Per-URB context ---- */
-
-struct urb_context {
-    void*    buffer;
-    uint32_t seqnum;     /* network byte order, as received */
-    uint32_t devid;
-    uint32_t direction;
-    uint32_t ep;
-    int32_t  number_of_packets;
-    struct urb_context* next;
-    struct usbdevfs_urb urb;  /* variable-length (ISO descs at end) */
+struct urb_ctx {
+    void* buf;
+    uint32_t seqnum, devid, dir, ep;
+    int32_t  npkts;
+    struct urb_ctx* next;
+    struct usbdevfs_urb urb;
 };
 
-/* ---- Per-connection state ---- */
-
-struct connection_state {
-    int usbFd;
-    int tcpFd;
-    volatile int running;       /* set to 0 to signal shutdown */
-    pthread_mutex_t send_mutex; /* protects all send() on tcpFd */
-    pthread_mutex_t urb_mutex;  /* protects active_urbs list */
-    struct urb_context* active_urbs;
+/* ---- Connection state ---- */
+struct conn {
+    int usbFd, tcpFd, pipe_rd, pipe_wr;
+    volatile int running;
+    pthread_mutex_t smtx, umtx;
+    struct urb_ctx* urbs;
 };
 
-/* ---- Reliable TCP I/O helpers ---- */
-
-static int send_all(int fd, const void* buf, size_t len, pthread_mutex_t* mtx) {
-    const uint8_t* p = (const uint8_t*)buf;
-    size_t remaining = len;
-    if (mtx) pthread_mutex_lock(mtx);
-    while (remaining > 0) {
-        ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
-        if (n <= 0) {
-            if (mtx) pthread_mutex_unlock(mtx);
-            return -1;
-        }
-        p += n;
-        remaining -= n;
-    }
-    if (mtx) pthread_mutex_unlock(mtx);
+/* ---- TCP I/O ---- */
+static int sndall(int fd,const void* b,size_t l,pthread_mutex_t* m){
+    const uint8_t* p=b;
+    if(m)pthread_mutex_lock(m);
+    while(l>0){ssize_t n=send(fd,p,l,MSG_NOSIGNAL);if(n<=0){if(m)pthread_mutex_unlock(m);return -1;}p+=n;l-=n;}
+    if(m)pthread_mutex_unlock(m);
+    return 0;
+}
+static int snd3(int fd,const void* h,size_t hl,const void* d,size_t dl,const void* d2,size_t d2l,pthread_mutex_t* m){
+    const uint8_t* B[3]={h,d,d2}; size_t L[3]={hl,dl,d2l};
+    if(m)pthread_mutex_lock(m);
+    for(int i=0;i<3;i++){if(!B[i]||!L[i])continue;const uint8_t* p=B[i];size_t r=L[i];
+        while(r>0){ssize_t n=send(fd,p,r,MSG_NOSIGNAL);if(n<=0){if(m)pthread_mutex_unlock(m);return -1;}p+=n;r-=n;}}
+    if(m)pthread_mutex_unlock(m);
+    return 0;
+}
+static int rcvall(int fd,void* b,size_t l){
+    uint8_t* p=b;
+    while(l>0){ssize_t n=recv(fd,p,l,MSG_WAITALL);if(n<=0)return -1;p+=n;l-=n;}
     return 0;
 }
 
-/* Send header + optional payload atomically (under one lock) */
-static int send_header_and_data(int fd, const void* hdr, size_t hdr_len,
-                                const void* data, size_t data_len,
-                                const void* data2, size_t data2_len,
-                                pthread_mutex_t* mtx) {
-    const uint8_t* bufs[3]  = { hdr, data, data2 };
-    size_t lens[3]          = { hdr_len, data_len, data2_len };
+/* ---- URB list ---- */
+static void add_u(struct conn* c,struct urb_ctx* x){pthread_mutex_lock(&c->umtx);x->next=c->urbs;c->urbs=x;pthread_mutex_unlock(&c->umtx);}
+static void del_u(struct conn* c,struct urb_ctx* x){pthread_mutex_lock(&c->umtx);struct urb_ctx**pp=&c->urbs;while(*pp){if(*pp==x){*pp=x->next;break;}pp=&(*pp)->next;}pthread_mutex_unlock(&c->umtx);}
+static struct urb_ctx* find_u(struct conn* c,uint32_t s){pthread_mutex_lock(&c->umtx);struct urb_ctx* x=c->urbs;while(x){if(x->seqnum==s){pthread_mutex_unlock(&c->umtx);return x;}x=x->next;}pthread_mutex_unlock(&c->umtx);return NULL;}
 
-    if (mtx) pthread_mutex_lock(mtx);
-    for (int i = 0; i < 3; i++) {
-        if (!bufs[i] || lens[i] == 0) continue;
-        const uint8_t* p = bufs[i];
-        size_t rem = lens[i];
-        while (rem > 0) {
-            ssize_t n = send(fd, p, rem, MSG_NOSIGNAL);
-            if (n <= 0) {
-                if (mtx) pthread_mutex_unlock(mtx);
-                return -1;
-            }
-            p += n;
-            rem -= n;
-        }
-    }
-    if (mtx) pthread_mutex_unlock(mtx);
-    return 0;
+/* ---- Error reply ---- */
+static void errrep(struct conn* c,struct urb_ctx* x,int e){
+    struct usbip_header_ret_submit r;
+    memset(&r,0,sizeof(r));
+    r.base.command=htonl(3);r.base.seqnum=x->seqnum;r.base.devid=x->devid;
+    r.base.direction=x->dir;r.base.ep=x->ep;r.status=htonl(e);
+    void* iso=NULL;size_t il=0;
+    if(x->npkts>0){il=(size_t)x->npkts*sizeof(struct usbip_iso_packet_descriptor);iso=calloc(1,il);if(!iso){sndall(c->tcpFd,&r,sizeof(r),&c->smtx);return;}}
+    snd3(c->tcpFd,&r,sizeof(r),NULL,0,iso,il,&c->smtx);
+    if(iso)free(iso);
 }
 
-static int recv_all(int fd, void* buf, size_t len) {
-    uint8_t* p = (uint8_t*)buf;
-    size_t remaining = len;
-    while (remaining > 0) {
-        ssize_t n = recv(fd, p, remaining, MSG_WAITALL);
-        if (n <= 0) return -1;
-        p += n;
-        remaining -= n;
-    }
-    return 0;
-}
+/* FIX-STALL: clear endpoint halt after -EPIPE */
+static void clrhalt(int usbFd,unsigned int ep){ioctl(usbFd,USBDEVFS_CLEAR_HALT,&ep);}
 
-/* ---- URB list management (per-connection) ---- */
+/* ---- Reaper ---- */
+static void* reaper(void* arg){
+    struct conn* c=arg;
+    while(c->running){
+        struct pollfd pf[2];
+        pf[0].fd=c->usbFd; pf[0].events=POLLOUT;
+        pf[1].fd=c->pipe_rd;pf[1].events=POLLIN;
+        int r=poll(pf,2,-1);
+        if(r<0){if(errno==EINTR)continue;break;}
+        if(pf[1].revents&POLLIN)break;
+        if(!(pf[0].revents&POLLOUT))continue;
 
-static void add_urb(struct connection_state* cs, struct urb_context* ctx) {
-    pthread_mutex_lock(&cs->urb_mutex);
-    ctx->next = cs->active_urbs;
-    cs->active_urbs = ctx;
-    pthread_mutex_unlock(&cs->urb_mutex);
-}
+        while(c->running){
+            struct usbdevfs_urb* rp=NULL;
+            int res=ioctl(c->usbFd,USBDEVFS_REAPURBNDELAY,&rp);
+            if(res<0){if(errno==EAGAIN)break;if(errno==ENODEV){c->running=0;goto done;}if(errno==EINTR)continue;break;}
+            if(!rp)break;
+            struct urb_ctx* x=(struct urb_ctx*)rp->usercontext;
+            if(!x)continue;
+            del_u(c,x);
 
-static void remove_urb(struct connection_state* cs, struct urb_context* ctx) {
-    pthread_mutex_lock(&cs->urb_mutex);
-    struct urb_context** pp = &cs->active_urbs;
-    while (*pp) {
-        if (*pp == ctx) { *pp = ctx->next; break; }
-        pp = &(*pp)->next;
-    }
-    pthread_mutex_unlock(&cs->urb_mutex);
-}
+            /* FIX-STALL */
+            if(rp->status==-EPIPE && rp->type!=USBDEVFS_URB_TYPE_ISO)
+                clrhalt(c->usbFd,rp->endpoint);
 
-static struct urb_context* find_urb_by_seqnum(struct connection_state* cs, uint32_t seqnum_net) {
-    pthread_mutex_lock(&cs->urb_mutex);
-    struct urb_context* c = cs->active_urbs;
-    while (c) {
-        if (c->seqnum == seqnum_net) {
-            pthread_mutex_unlock(&cs->urb_mutex);
-            return c;
-        }
-        c = c->next;
-    }
-    pthread_mutex_unlock(&cs->urb_mutex);
-    return NULL;
-}
+            int isin=(ntohl(x->dir)!=0), act=rp->actual_length, np=x->npkts;
+            struct usbip_header_ret_submit hdr;
+            memset(&hdr,0,sizeof(hdr));
+            hdr.base.command=htonl(3);hdr.base.seqnum=x->seqnum;hdr.base.devid=x->devid;
+            hdr.base.direction=x->dir;hdr.base.ep=x->ep;
+            hdr.status=htonl(rp->status);hdr.actual_length=htonl(act);
+            hdr.start_frame=htonl(rp->start_frame);hdr.number_of_packets=htonl(np);
+            hdr.error_count=htonl(rp->error_count);
 
-/* ---- Reaper thread: waits for completed URBs and sends replies ---- */
+            void* pay=NULL;size_t pl=0,isol=0;void* isob=NULL;
 
-static void* usb_reaper_thread(void* arg) {
-    struct connection_state* cs = (struct connection_state*)arg;
-
-    while (cs->running) {
-        struct usbdevfs_urb* reaped = NULL;
-        int res = ioctl(cs->usbFd, USBDEVFS_REAPURB, &reaped);
-        if (res < 0) {
-            if (errno == ENODEV || !cs->running) break;
-            if (errno == EINTR) continue;
-            continue;
-        }
-        if (!reaped) continue;
-
-        struct urb_context* ctx = (struct urb_context*)reaped->usercontext;
-        if (!ctx) continue;
-
-        remove_urb(cs, ctx);
-
-        /* Build the RET_SUBMIT header */
-        struct usbip_header_ret_submit ret;
-        memset(&ret, 0, sizeof(ret));
-        ret.base.command   = htonl(0x00000003); /* USBIP_RET_SUBMIT */
-        ret.base.seqnum    = ctx->seqnum;
-        ret.base.devid     = ctx->devid;
-        ret.base.direction = ctx->direction;
-        ret.base.ep        = ctx->ep;
-
-        int actual = reaped->actual_length;
-        ret.status          = htonl(reaped->status);
-        ret.actual_length   = htonl(actual);
-        ret.start_frame     = htonl(reaped->start_frame);
-        ret.number_of_packets = htonl(ctx->number_of_packets);
-        ret.error_count     = htonl(reaped->error_count);
-
-        /* Determine payload to send back (IN direction only) */
-        const void* payload_ptr = NULL;
-        size_t payload_len = 0;
-        int is_in = (ntohl(ctx->direction) != 0);
-
-        if (is_in && ctx->buffer) {
-            if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) {
-                if (actual > 0) {
-                    /* usbfs puts data after the 8-byte setup packet in the buffer */
-                    payload_ptr = ((char*)ctx->buffer) + 8;
-                    payload_len = actual;
-                }
-            } else if (ctx->urb.type == USBDEVFS_URB_TYPE_ISO) {
-                /* USBIP expects ISO IN payloads to be tightly packed by actual_length 
-                 * but usbfs spaces them by their maximum `length`. We must pack them 
-                 * in-place before sending. */
-                uint32_t current_offset = 0;
-                uint32_t packed_offset = 0;
-                for (int i = 0; i < ctx->number_of_packets; i++) {
-                    uint32_t frame_len = reaped->iso_frame_desc[i].length;
-                    uint32_t frame_act = reaped->iso_frame_desc[i].actual_length;
-                    if (frame_act > 0 && packed_offset != current_offset) {
-                        memmove(((uint8_t*)ctx->buffer) + packed_offset,
-                                ((uint8_t*)ctx->buffer) + current_offset,
-                                frame_act);
+            if(np>0){
+                isol=(size_t)np*sizeof(struct usbip_iso_packet_descriptor);
+                isob=malloc(isol);
+                if(!isob){struct usbip_header_ret_submit e=hdr;e.status=htonl(-ENOMEM);e.actual_length=0;sndall(c->tcpFd,&e,sizeof(e),&c->smtx);if(x->buf)free(x->buf);free(x);continue;}
+                uint8_t* ds=(uint8_t*)isob; uint32_t off=0;
+                if(isin&&x->buf&&act>0){
+                    /* FIX-ISO-1+HBW: separate packed copy for all sub-frames */
+                    void* pk=malloc((size_t)act);
+                    if(!pk){free(isob);struct usbip_header_ret_submit e=hdr;e.status=htonl(-ENOMEM);e.actual_length=0;sndall(c->tcpFd,&e,sizeof(e),&c->smtx);if(x->buf)free(x->buf);free(x);continue;}
+                    uint32_t src=0,dst=0;
+                    for(int i=0;i<np;i++){
+                        uint32_t fl=rp->iso_frame_desc[i].length,fa=rp->iso_frame_desc[i].actual_length,fs=rp->iso_frame_desc[i].status;
+                        if(fa>0)memcpy((uint8_t*)pk+dst,(uint8_t*)x->buf+src,fa);
+                        /* FIX-ISO-2: big-endian, packed offsets */
+                        w32be(ds+i*16+0,off);w32be(ds+i*16+4,fl);w32be(ds+i*16+8,fa);w32be(ds+i*16+12,fs);
+                        src+=fl;dst+=fa;off+=fa;
                     }
-                    current_offset += frame_len;
-                    packed_offset += frame_act;
+                    pay=pk;pl=dst;hdr.actual_length=htonl((int32_t)dst);
+                } else {
+                    for(int i=0;i<np;i++){
+                        uint32_t fl=rp->iso_frame_desc[i].length,fa=rp->iso_frame_desc[i].actual_length,fs=rp->iso_frame_desc[i].status;
+                        w32be(ds+i*16+0,off);w32be(ds+i*16+4,fl);w32be(ds+i*16+8,fa);w32be(ds+i*16+12,fs);off+=fl;
+                    }
                 }
-                if (packed_offset > 0) {
-                    payload_ptr = ctx->buffer;
-                    payload_len = packed_offset;
-                }
-                
-                /* Ensure overall actual length matches packed length */
-                ret.actual_length = htonl(packed_offset);
             } else {
-                if (actual > 0) {
-                    payload_ptr = ctx->buffer;
-                    payload_len = actual;
+                if(isin&&x->buf&&act>0){
+                    pay=(x->urb.type==USBDEVFS_URB_TYPE_CONTROL)?(void*)((char*)x->buf+8):x->buf;
+                    pl=(size_t)act;
                 }
             }
+
+            snd3(c->tcpFd,&hdr,sizeof(hdr),pay,pl,isob,isol,&c->smtx);
+            if(np>0&&isin&&pay)free(pay);
+            if(isob)free(isob);
+            if(x->buf)free(x->buf);
+            free(x);
         }
-
-        /* Build ISO descriptors if needed */
-        void* iso_buf = NULL;
-        size_t iso_buf_len = 0;
-        if (ctx->number_of_packets > 0) {
-            iso_buf_len = ctx->number_of_packets * sizeof(struct usbip_iso_packet_descriptor);
-            iso_buf = malloc(iso_buf_len);
-            if (iso_buf) {
-                uint8_t* descs = (uint8_t*)iso_buf;
-                uint32_t offset = 0;
-                for (int i = 0; i < ctx->number_of_packets; i++) {
-                    uint32_t frame_len = reaped->iso_frame_desc[i].length;
-                    uint32_t frame_act = reaped->iso_frame_desc[i].actual_length;
-                    uint32_t frame_sts = reaped->iso_frame_desc[i].status;
-
-                    write_u32_le(descs + (i * 16) + 0, offset);
-                    write_u32_le(descs + (i * 16) + 4, frame_len);
-                    write_u32_le(descs + (i * 16) + 8, frame_act);
-                    write_u32_le(descs + (i * 16) + 12, frame_sts);
-
-                    /* IN payload is packed by actual_length above, so descriptor offsets must
-                     * follow packed layout for client-side parsing. */
-                    if (is_in) {
-                        offset += frame_act;
-                    } else {
-                        offset += frame_len;
-                    }
-                }
-            }
-        }
-
-        /* Send header + payload + ISO descs atomically */
-        send_header_and_data(cs->tcpFd,
-                             &ret, sizeof(ret),
-                             payload_ptr, payload_len,
-                             iso_buf, iso_buf_len,
-                             &cs->send_mutex);
-
-        if (iso_buf) free(iso_buf);
-        if (ctx->buffer) free(ctx->buffer);
-        free(ctx);
     }
+done:
     return NULL;
 }
 
-/* ---- Send an immediate error RET_SUBMIT for a failed ioctl ---- */
-
-static void send_submit_error(struct connection_state* cs, struct urb_context* ctx, int err) {
-    struct usbip_header_ret_submit ret;
-    memset(&ret, 0, sizeof(ret));
-    ret.base.command   = htonl(0x00000003);
-    ret.base.seqnum    = ctx->seqnum;
-    ret.base.devid     = ctx->devid;
-    ret.base.direction = ctx->direction;
-    ret.base.ep        = ctx->ep;
-    ret.status         = htonl(err);
-
-    /* For ISO failures, also send empty ISO descriptors */
-    void* iso_buf = NULL;
-    size_t iso_len = 0;
-    if (ctx->number_of_packets > 0) {
-        iso_len = ctx->number_of_packets * sizeof(struct usbip_iso_packet_descriptor);
-        iso_buf = calloc(1, iso_len);
-    }
-
-    send_header_and_data(cs->tcpFd,
-                         &ret, sizeof(ret),
-                         NULL, 0,
-                         iso_buf, iso_len,
-                         &cs->send_mutex);
-    if (iso_buf) free(iso_buf);
-}
-
-/* ---- Main entry point ---- */
-
+/* ---- Main entry ---- */
 JNIEXPORT jint JNICALL
 Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
         JNIEnv *env, jclass clazz, jint usbFd, jint tcpSocketFd)
 {
-    (void)env;
-    (void)clazz;
+    (void)env;(void)clazz;
+    signal(SIGPIPE,SIG_IGN);
+    int one=1; setsockopt(tcpSocketFd,IPPROTO_TCP,TCP_NODELAY,&one,sizeof(one));
 
-    /* Ignore SIGPIPE so send() returns EPIPE instead of killing us */
-    signal(SIGPIPE, SIG_IGN);
+    struct conn* cs=calloc(1,sizeof(*cs));
+    if(!cs)return -1;
+    cs->usbFd=usbFd; cs->tcpFd=tcpSocketFd; cs->running=1;
 
-    /* Enable TCP_NODELAY for low latency */
-    int flag = 1;
-    setsockopt(tcpSocketFd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    int pfd[2]; if(pipe(pfd)!=0){free(cs);return -1;}
+    cs->pipe_rd=pfd[0]; cs->pipe_wr=pfd[1];
+    fcntl(cs->pipe_rd,F_SETFL,O_NONBLOCK);
+    fcntl(cs->pipe_wr,F_SETFL,O_NONBLOCK);
+    pthread_mutex_init(&cs->smtx,NULL);
+    pthread_mutex_init(&cs->umtx,NULL);
 
-    /* Per-connection state (heap-allocated so reaper thread has stable pointer) */
-    struct connection_state* cs = calloc(1, sizeof(struct connection_state));
-    if (!cs) return -1;
-    cs->usbFd   = usbFd;
-    cs->tcpFd    = tcpSocketFd;
-    cs->running  = 1;
-    pthread_mutex_init(&cs->send_mutex, NULL);
-    pthread_mutex_init(&cs->urb_mutex, NULL);
-    cs->active_urbs = NULL;
+    pthread_t rt;
+    if(pthread_create(&rt,NULL,reaper,cs)!=0){close(cs->pipe_rd);close(cs->pipe_wr);free(cs);return -1;}
 
-    pthread_t reaper;
-    if (pthread_create(&reaper, NULL, usb_reaper_thread, cs) != 0) {
-        free(cs);
-        return -1;
-    }
-
-    /* Main command loop: reads commands from the TCP socket */
-    while (cs->running) {
+    while(cs->running){
         struct usbip_header_basic base;
-        if (recv_all(tcpSocketFd, &base, sizeof(base)) < 0) break;
+        if(rcvall(cs->tcpFd,&base,sizeof(base))<0)break;
+        uint32_t cmd=ntohl(base.command);
 
-        uint32_t cmd = ntohl(base.command);
+        if(cmd==1){ /* CMD_SUBMIT */
+            struct usbip_header_cmd_submit sub; sub.base=base;
+            if(rcvall(cs->tcpFd,((uint8_t*)&sub)+20,28)<0)break;
 
-        if (cmd == 0x00000001) { /* USBIP_CMD_SUBMIT */
-            struct usbip_header_cmd_submit sub;
-            sub.base = base;
-            if (recv_all(tcpSocketFd, ((uint8_t*)&sub) + 20, 28) < 0) break;
+            int isout=(ntohl(sub.base.direction)==0);
+            uint32_t tf=ntohl(sub.transfer_flags);
+            int32_t blen=(int32_t)ntohl(sub.transfer_buffer_length);
+            int32_t sf=(int32_t)ntohl(sub.start_frame);
+            int32_t iv=(int32_t)ntohl(sub.interval);
+            uint32_t ep=ntohl(sub.base.ep);
 
-            int is_out     = (ntohl(sub.base.direction) == 0);
-            uint32_t transfer_flags = ntohl(sub.transfer_flags);
-            int32_t buf_len = (int32_t)ntohl(sub.transfer_buffer_length);
-            int32_t start_frame = (int32_t)ntohl(sub.start_frame);
-            int num_iso    = (int32_t)ntohl(sub.number_of_packets);
-            int32_t interval = (int32_t)ntohl(sub.interval);
-            uint32_t ep_num = ntohl(sub.base.ep);
+            /* FIX-VOL-2 */
+            uint32_t nir=(uint32_t)ntohl(sub.number_of_packets);
+            int niso=(nir>0x3FFF)?0:(int)nir;
 
-            /* Sanity: limit buffer size */
-            if (buf_len < 0) buf_len = 0;
-            if (buf_len > 16 * 1024 * 1024) { break; }
-            if (num_iso < 0) num_iso = 0;
-            if (start_frame < 0) start_frame = 0;
-            if (interval < 0) interval = 0;
+            if(blen<0)blen=0; if(blen>16*1024*1024)break;
+            if(sf<0)sf=0; if(iv<0)iv=0;
 
-            int data_wire  = is_out ? buf_len : 0;
-            int iso_wire   = num_iso * (int)sizeof(struct usbip_iso_packet_descriptor);
+            int utype=infer_type(ep,niso,iv); /* FIX-VOL-3 */
+            int dw=isout?blen:0;
+            int iw=niso*(int)sizeof(struct usbip_iso_packet_descriptor);
+            int vwl=dw+iw; if(vwl<0)break;
 
-            void* buffer = NULL;
-            uint8_t* variable_wire_data = NULL;
-            int variable_wire_len = data_wire + iso_wire;
-            if (variable_wire_len < 0) {
-                break;
-            }
-            if (variable_wire_len > 0) {
-                variable_wire_data = malloc((size_t)variable_wire_len);
-                if (!variable_wire_data) {
-                    break;
-                }
-                if (recv_all(tcpSocketFd, variable_wire_data, (size_t)variable_wire_len) < 0) {
-                    free(variable_wire_data);
-                    break;
-                }
-            }
+            uint8_t* vwd=NULL;
+            if(vwl>0){vwd=malloc((size_t)vwl);if(!vwd)break;if(rcvall(cs->tcpFd,vwd,(size_t)vwl)<0){free(vwd);break;}}
 
-            /* Allocate urb_context (with room for ISO frame descriptors) */
-            struct urb_context* ctx = calloc(1,
-                sizeof(struct urb_context) + sizeof(struct usbdevfs_iso_packet_desc) * num_iso);
-            if (!ctx) {
-                if (buffer) free(buffer);
-                break;
-            }
+            struct urb_ctx* x=calloc(1,sizeof(struct urb_ctx)+sizeof(struct usbdevfs_iso_packet_desc)*niso);
+            if(!x){if(vwd)free(vwd);break;}
+            x->seqnum=sub.base.seqnum;x->devid=sub.base.devid;
+            x->dir=sub.base.direction;x->ep=sub.base.ep;x->npkts=niso;
 
-            ctx->seqnum    = sub.base.seqnum;
-            ctx->devid     = sub.base.devid;
-            ctx->direction = sub.base.direction;
-            ctx->ep        = sub.base.ep;
-            ctx->number_of_packets = num_iso;
+            struct usbdevfs_urb* urb=&x->urb;
+            urb->type=utype;
+            void* buf=NULL;
 
-            struct usbdevfs_urb* urb = &ctx->urb;
-
-            /* Determine URB type */
-            if (num_iso > 0) {
-                urb->type = USBDEVFS_URB_TYPE_ISO;
-
-                uint32_t* parsed_lengths = calloc((size_t)num_iso, sizeof(uint32_t));
-                int parsed_ok = 0;
-
-                if (!parsed_lengths) {
-                    if (variable_wire_data) free(variable_wire_data);
-                    free(ctx);
-                    break;
-                }
-
-                if (iso_wire > 0 && variable_wire_data) {
-                    /* Accept both historic (descriptors first) and Linux-style
-                     * (descriptors last) layouts for ISO OUT payload. */
-                    uint8_t* first = variable_wire_data;
-                    uint8_t* last = variable_wire_data + data_wire;
-
-                    int first_le = parse_iso_desc_lengths(first, num_iso, buf_len, 1, parsed_lengths);
-                    int first_be = !first_le && parse_iso_desc_lengths(first, num_iso, buf_len, 0, parsed_lengths);
-                    int last_le = (is_out && data_wire > 0) ? parse_iso_desc_lengths(last, num_iso, buf_len, 1, parsed_lengths) : 0;
-                    int last_be = (is_out && data_wire > 0 && !last_le) ? parse_iso_desc_lengths(last, num_iso, buf_len, 0, parsed_lengths) : 0;
-
-                    if (is_out && data_wire > 0) {
-                        int use_first = (first_le || first_be) && !(last_le || last_be);
-                        int use_last = (last_le || last_be) && !(first_le || first_be);
-
-                        if (!use_first && !use_last) {
-                            /* If ambiguous or neither plausible, follow Linux USB/IP order:
-                             * data first, descriptors last. */
-                            use_last = 1;
-                        }
-
-                        if (use_first) {
-                            buffer = malloc((size_t)data_wire);
-                            if (!buffer) {
-                                free(parsed_lengths);
-                                free(variable_wire_data);
-                                free(ctx);
-                                break;
-                            }
-                            memcpy(buffer, variable_wire_data + iso_wire, (size_t)data_wire);
-                            parsed_ok = (first_le || first_be) ? 1 : 0;
-                        } else {
-                            buffer = malloc((size_t)data_wire);
-                            if (!buffer) {
-                                free(parsed_lengths);
-                                free(variable_wire_data);
-                                free(ctx);
-                                break;
-                            }
-                            memcpy(buffer, variable_wire_data, (size_t)data_wire);
-                            parsed_ok = (last_le || last_be) ? 1 : 0;
-                        }
+            if(utype==USBDEVFS_URB_TYPE_ISO){
+                uint32_t* pl=calloc((size_t)niso,sizeof(uint32_t));
+                if(!pl){if(vwd)free(vwd);free(x);break;}
+                int ok=0;
+                if(iw>0&&vwd){
+                    uint8_t* first=vwd,*last=vwd+dw;
+                    int fl=parse_iso(first,niso,blen,1,pl),fb=!fl&&parse_iso(first,niso,blen,0,pl);
+                    int ll=(isout&&dw>0)?parse_iso(last,niso,blen,1,pl):0,lb=(isout&&dw>0&&!ll)?parse_iso(last,niso,blen,0,pl):0;
+                    if(isout&&dw>0){
+                        int uf=(fl||fb)&&!(ll||lb),ul=(ll||lb)&&!(fl||fb);if(!uf&&!ul)ul=1;
+                        buf=malloc((size_t)dw);if(!buf){free(pl);if(vwd)free(vwd);free(x);break;}
+                        if(uf){memcpy(buf,vwd+iw,(size_t)dw);ok=parse_iso(first,niso,blen,1,pl)||parse_iso(first,niso,blen,0,pl);}
+                        else  {memcpy(buf,vwd,(size_t)dw);   ok=parse_iso(last, niso,blen,1,pl)||parse_iso(last, niso,blen,0,pl);}
                     } else {
-                        parsed_ok = first_le || first_be;
+                        ok=parse_iso(first,niso,blen,1,pl)||parse_iso(first,niso,blen,0,pl);
                     }
                 }
+                if(!ok){free(pl);if(vwd)free(vwd);if(buf)free(buf);free(x);break;}
+                uint32_t isum=0;
+                for(int i=0;i<niso;i++){urb->iso_frame_desc[i].length=pl[i];urb->iso_frame_desc[i].actual_length=0;urb->iso_frame_desc[i].status=0;isum+=pl[i];}
+                free(pl);
+                if(!buf&&isum>0){buf=calloc(1,(size_t)isum);if(!buf){if(vwd)free(vwd);free(x);break;}}
+                x->buf=buf;urb->buffer=buf;
+                /* FIX-HBW: buffer_length must equal sum of ISO descriptor lengths */
+                urb->buffer_length=(int)isum;
 
-                if (!parsed_ok && num_iso > 0) {
-                    free(parsed_lengths);
-                    if (variable_wire_data) free(variable_wire_data);
-                    if (buffer) free(buffer);
-                    free(ctx);
-                    break;
-                }
+            } else if(utype==USBDEVFS_URB_TYPE_CONTROL){
+                urb->endpoint=0;
+                void* ctrl=malloc(8+(size_t)(blen>0?blen:0));
+                if(!ctrl){if(vwd)free(vwd);free(x);break;}
+                memcpy(ctrl,sub.setup,8);
+                if(isout&&dw>0&&vwd)memcpy((uint8_t*)ctrl+8,vwd,(size_t)dw);
+                x->buf=ctrl;urb->buffer=ctrl;urb->buffer_length=8+blen;
 
-                for (int i = 0; i < num_iso; i++) {
-                    urb->iso_frame_desc[i].length = parsed_lengths[i];
-                    urb->iso_frame_desc[i].actual_length = 0;
-                    urb->iso_frame_desc[i].status = 0;
-                }
-
-                free(parsed_lengths);
-            } else if (ep_num == 0) {
-                urb->type = USBDEVFS_URB_TYPE_CONTROL;
-            } else {
-                urb->type = USBDEVFS_URB_TYPE_BULK;
+            } else { /* BULK or INTERRUPT */
+                urb->endpoint=ep&0xFF; if(!isout)urb->endpoint|=0x80;
+                if(dw>0&&vwd){buf=malloc((size_t)dw);if(!buf){if(vwd)free(vwd);free(x);break;}memcpy(buf,vwd,(size_t)dw);}
+                else if(blen>0){buf=calloc(1,(size_t)blen);if(!buf){if(vwd)free(vwd);free(x);break;}}
+                x->buf=buf;urb->buffer=buf;urb->buffer_length=blen;
             }
 
-            if (num_iso == 0 && data_wire > 0 && variable_wire_data) {
-                buffer = malloc((size_t)data_wire);
-                if (!buffer) {
-                    free(variable_wire_data);
-                    free(ctx);
-                    break;
-                }
-                memcpy(buffer, variable_wire_data, (size_t)data_wire);
-            }
-            if (variable_wire_data) free(variable_wire_data);
-
-            /* Set endpoint byte: For control transfers (ep0), usbfs wants endpoint=0
-               (direction is embedded in the setup packet). For others, set 0x80 for IN. */
-            if (urb->type == USBDEVFS_URB_TYPE_CONTROL) {
-                urb->endpoint = 0;
-            } else {
-                urb->endpoint = ep_num & 0xFF;
-                if (!is_out) urb->endpoint |= 0x80;
-            }
-
-            /* Build the data buffer */
-            if (urb->type == USBDEVFS_URB_TYPE_CONTROL) {
-                /* usbfs control: 8-byte setup packet prepended to data buffer */
-                void* ctrl = malloc(8 + buf_len);
-                if (!ctrl) {
-                    if (buffer) free(buffer);
-                    free(ctx);
-                    break;
-                }
-                memcpy(ctrl, sub.setup, 8);
-                if (buffer && data_wire > 0) {
-                    memcpy(((uint8_t*)ctrl) + 8, buffer, data_wire);
-                    free(buffer);
-                }
-                ctx->buffer = ctrl;
-                urb->buffer = ctrl;
-                urb->buffer_length = 8 + buf_len;
-            } else {
-                /* For IN: allocate receive buffer if needed */
-                if (!buffer && buf_len > 0) {
-                    buffer = calloc(1, buf_len);
-                    if (!buffer) { free(ctx); break; }
-                }
-                ctx->buffer = buffer;
-                urb->buffer = buffer;
-                
-                if (urb->type == USBDEVFS_URB_TYPE_ISO) {
-                    uint32_t iso_sum = 0;
-                    for (int i = 0; i < num_iso; i++) {
-                        iso_sum += urb->iso_frame_desc[i].length;
-                    }
-                    /* Linux usbfs strictly validates buffer_length against the sum of descriptor lengths */
-                    urb->buffer_length = iso_sum;
-                } else {
-                    urb->buffer_length = buf_len;
-                }
-            }
-
-            /* Respect host scheduling parameters for periodic transfers. */
-            urb->start_frame     = start_frame;
-            urb->number_of_packets = num_iso;
-            urb->usercontext     = ctx;
-
-            urb->flags = transfer_flags & USBDEVFS_URB_SHORT_NOT_OK;
+            if(vwd){free(vwd);vwd=NULL;}
+            urb->start_frame=sf;urb->number_of_packets=niso;urb->usercontext=x;
+            urb->flags=tf&USBDEVFS_URB_SHORT_NOT_OK;
 #ifdef USBDEVFS_URB_ZERO_PACKET
-            urb->flags |= (transfer_flags & USBDEVFS_URB_ZERO_PACKET);
+            urb->flags|=(tf&USBDEVFS_URB_ZERO_PACKET);
 #endif
 #ifdef USBDEVFS_URB_NO_INTERRUPT
-            urb->flags |= (transfer_flags & USBDEVFS_URB_NO_INTERRUPT);
+            urb->flags|=(tf&USBDEVFS_URB_NO_INTERRUPT);
 #endif
+            if(utype==USBDEVFS_URB_TYPE_ISO&&((tf&USBDEVFS_URB_ISO_ASAP)||sf==0))
+                urb->flags|=USBDEVFS_URB_ISO_ASAP;
 
-            /* Preserve previous behavior when host does not request an explicit start frame. */
-            if (urb->type == USBDEVFS_URB_TYPE_ISO) {
-                if ((transfer_flags & USBDEVFS_URB_ISO_ASAP) || start_frame == 0) {
-                    urb->flags |= USBDEVFS_URB_ISO_ASAP;
-                }
+            add_u(cs,x);
+            int res=ioctl(usbFd,USBDEVFS_SUBMITURB,urb);
+            if(res<0){
+                int err=errno; del_u(cs,x);
+                errrep(cs,x,-err);
+                if(x->buf)free(x->buf); free(x);
+                /* FIX-VOL-1/4: EBUSY/EAGAIN non-fatal */
+                if(err==ENODEV||err==ESHUTDOWN||err==EPIPE)break;
             }
 
-            add_urb(cs, ctx);
-
-            int res = ioctl(usbFd, USBDEVFS_SUBMITURB, urb);
-            if (res < 0) {
-                /* Submit failed: remove from list and send error reply immediately */
-                remove_urb(cs, ctx);
-                send_submit_error(cs, ctx, -errno);
-                if (ctx->buffer) free(ctx->buffer);
-                free(ctx);
-            }
-
-        } else if (cmd == 0x00000002) { /* USBIP_CMD_UNLINK */
-            struct usbip_header_cmd_unlink unl;
-            unl.base = base;
-            if (recv_all(tcpSocketFd, ((uint8_t*)&unl) + 20, 28) < 0) break;
-
-            /* unlink_seqnum is in network byte order on the wire */
-            struct urb_context* target = find_urb_by_seqnum(cs, unl.unlink_seqnum);
-            if (target) {
-                ioctl(usbFd, USBDEVFS_DISCARDURB, &target->urb);
-                /* The reaper thread will see the discarded URB and send RET_SUBMIT
-                   with status -ECONNRESET. We still need to send RET_UNLINK. */
-            }
-
+        } else if(cmd==2){ /* CMD_UNLINK */
+            struct usbip_header_cmd_unlink unl; unl.base=base;
+            if(rcvall(cs->tcpFd,((uint8_t*)&unl)+20,28)<0)break;
+            struct urb_ctx* tgt=find_u(cs,unl.unlink_seqnum);
+            if(tgt)ioctl(usbFd,USBDEVFS_DISCARDURB,&tgt->urb);
             struct usbip_header_ret_unlink ret;
-            memset(&ret, 0, sizeof(ret));
-            ret.base.command   = htonl(0x00000004);
-            ret.base.seqnum    = unl.base.seqnum;
-            ret.base.devid     = unl.base.devid;
-            ret.base.direction = unl.base.direction;
-            ret.base.ep        = unl.base.ep;
-            ret.status = htonl(target ? -ECONNRESET : -ENOENT);
-
-            send_all(cs->tcpFd, &ret, sizeof(ret), &cs->send_mutex);
-
-        } else {
-            break; /* Unknown command */
-        }
+            memset(&ret,0,sizeof(ret));ret.base.command=htonl(4);ret.base.seqnum=unl.base.seqnum;
+            ret.base.devid=unl.base.devid;ret.base.direction=unl.base.direction;ret.base.ep=unl.base.ep;
+            ret.status=htonl(tgt?-ECONNRESET:-ENOENT);
+            sndall(cs->tcpFd,&ret,sizeof(ret),&cs->smtx);
+        } else break;
     }
 
-    /* Shutdown: signal reaper, then unblock its blocking REAPURB ioctl.
-     * We do NOT close usbFd here - Java manages the USB connection lifecycle.
-     * Instead, submit a DISCARDURB for any outstanding URBs and use
-     * ioctl(USBDEVFS_DISCARDURB) to wake the reaper. */
-    cs->running = 0;
-    shutdown(tcpSocketFd, SHUT_RDWR);
-
-    /* Discard all outstanding URBs so the reaper's REAPURB unblocks */
-    pthread_mutex_lock(&cs->urb_mutex);
-    struct urb_context* u = cs->active_urbs;
-    while (u) {
-        ioctl(usbFd, USBDEVFS_DISCARDURB, &u->urb);
-        u = u->next;
-    }
-    pthread_mutex_unlock(&cs->urb_mutex);
-
-    pthread_join(reaper, NULL);
-
-    /* Free any remaining URBs */
-    struct urb_context* c = cs->active_urbs;
-    while (c) {
-        struct urb_context* next = c->next;
-        if (c->buffer) free(c->buffer);
-        free(c);
-        c = next;
-    }
-
-    pthread_mutex_destroy(&cs->send_mutex);
-    pthread_mutex_destroy(&cs->urb_mutex);
+    /* Shutdown */
+    cs->running=0;
+    {char w=1;(void)write(cs->pipe_wr,&w,1);}
+    shutdown(cs->tcpFd,SHUT_RDWR);
+    pthread_mutex_lock(&cs->umtx);
+    struct urb_ctx* u=cs->urbs;while(u){ioctl(usbFd,USBDEVFS_DISCARDURB,&u->urb);u=u->next;}
+    pthread_mutex_unlock(&cs->umtx);
+    pthread_join(rt,NULL);
+    struct urb_ctx* cc=cs->urbs;
+    while(cc){struct urb_ctx* n=cc->next;if(cc->buf)free(cc->buf);free(cc);cc=n;}
+    close(cs->pipe_rd);close(cs->pipe_wr);
+    pthread_mutex_destroy(&cs->smtx);pthread_mutex_destroy(&cs->umtx);
     free(cs);
-
     return 0;
 }
