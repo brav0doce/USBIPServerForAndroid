@@ -475,8 +475,9 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 int ok=0;
                 if(iw>0&&vwd){
                     uint8_t* first=vwd,*last=vwd+dw;
-                    int fl=parse_iso(first,niso,blen,1,pl),fb=!fl&&parse_iso(first,niso,blen,0,pl);
-                    int ll=(isout&&dw>0)?parse_iso(last,niso,blen,1,pl):0,lb=(isout&&dw>0&&!ll)?parse_iso(last,niso,blen,0,pl):0;
+                    int limit = (isout && dw > 0) ? blen : 0x7FFFFFFF;
+                    int fl=parse_iso(first,niso,limit,1,pl),fb=!fl&&parse_iso(first,niso,limit,0,pl);
+                    int ll=(isout&&dw>0)?parse_iso(last,niso,limit,1,pl):0,lb=(isout&&dw>0&&!ll)?parse_iso(last,niso,limit,0,pl):0;
                     if(isout&&dw>0){
                         int uf=(fl||fb)&&!(ll||lb),ul=(ll||lb)&&!(fl||fb);if(!uf&&!ul)ul=1;
                         buf=malloc((size_t)dw);if(!buf){free(pl);if(vwd)free(vwd);free(x);break;}
@@ -486,7 +487,11 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                         ok=parse_iso(first,niso,blen,1,pl)||parse_iso(first,niso,blen,0,pl);
                     }
                 }
-                if(!ok){free(pl);if(vwd)free(vwd);if(buf)free(buf);free(x);break;}
+                if(!ok){
+                    free(pl);if(vwd)free(vwd);if(buf)free(buf);
+                    errrep(cs,x,-EINVAL); free(x);
+                    continue; /* FIX: Don't disconnect on malformed ISO descriptors */
+                }
                 uint32_t isum=0;
                 for(int i=0;i<niso;i++){urb->iso_frame_desc[i].length=pl[i];urb->iso_frame_desc[i].actual_length=0;urb->iso_frame_desc[i].status=0;isum+=pl[i];}
                 free(pl);
@@ -528,8 +533,8 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 int err=errno; del_u(cs,x);
                 errrep(cs,x,-err);
                 if(x->buf)free(x->buf); free(x);
-                /* FIX-VOL-1/4: EBUSY/EAGAIN non-fatal */
-                if(err==ENODEV||err==ESHUTDOWN||err==EPIPE)break;
+                /* FIX-VOL-1/4: EBUSY/EAGAIN non-fatal. EPIPE on submit also non-fatal to avoid disconnections */
+                if(err==ENODEV||err==ESHUTDOWN)break;
             }
 
         } else if(cmd==2){ /* CMD_UNLINK */
