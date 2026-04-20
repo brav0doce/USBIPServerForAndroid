@@ -320,7 +320,7 @@ static void errrep(struct conn* c,struct urb_ctx* x,int e){
     r.base.command=htonl(3);r.base.seqnum=x->seqnum;r.base.devid=x->devid;
     r.base.direction=x->dir;r.base.ep=x->ep;r.status=htonl(e);
     void* iso=NULL;size_t il=0;
-    if(x->npkts>0){il=(size_t)x->npkts*sizeof(struct usbip_iso_packet_descriptor);iso=calloc(1,il);if(!iso){sndall(c->tcpFd,&r,sizeof(r),&c->smtx);return;}}
+    if(x->npkts>0){il=(size_t)x->npkts*sizeof(struct usbip_iso_packet_descriptor);iso=calloc(1,il);if(!iso){sndall(c->tcpFd,&r,sizeof(r),&c->smtx);return;}r.number_of_packets=htonl((uint32_t)x->npkts);}
     snd3(c->tcpFd,&r,sizeof(r),NULL,0,iso,il,&c->smtx);
     if(iso)free(iso);
 }

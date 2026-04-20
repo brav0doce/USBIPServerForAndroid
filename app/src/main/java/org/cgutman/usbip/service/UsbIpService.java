@@ -209,15 +209,23 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 				FLAG_POSSIBLE_SPEED_FULL |
 				FLAG_POSSIBLE_SPEED_HIGH |
 				FLAG_POSSIBLE_SPEED_SUPER;
+		boolean hasIsoEndpoint = false;
+		boolean hasAudioInterface = dev.getDeviceClass() == UsbConstants.USB_CLASS_AUDIO;
 		
 		for (int i = 0; i < dev.getInterfaceCount(); i++) {
 			UsbInterface iface = dev.getInterface(i);
+			if (iface.getInterfaceClass() == UsbConstants.USB_CLASS_AUDIO) {
+				hasAudioInterface = true;
+			}
 			for (int j = 0; j < iface.getEndpointCount(); j++) {
 				UsbEndpoint endpoint = iface.getEndpoint(j);
 				if ((endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK) ||
 					(endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_ISOC)) {
 					// Low speed devices can't implement bulk or iso endpoints
 					possibleSpeeds &= ~FLAG_POSSIBLE_SPEED_LOW;
+				}
+				if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_ISOC) {
+					hasIsoEndpoint = true;
 				}
 				
 				if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_CONTROL) {
@@ -280,26 +288,21 @@ public class UsbIpService extends Service implements UsbRequestHandler {
 			}
 		}
 		
-		// Return the lowest speed that we're compatible with
-		System.out.printf("Speed heuristics for device %d left us with 0x%x\n",
-				dev.getDeviceId(), possibleSpeeds);
+		// USB audio devices often expose only isochronous endpoints. In that case, exporting
+		// them as the lowest possible speed can make the client program the wrong periodic
+		// schedule and drop the stream. Keep the conservative default for everything else.
+		int bcdUsb = devDesc != null ? (devDesc.bcdUSB & 0xFFFF) : -1;
+		System.out.printf("Speed heuristics for device %d left us with 0x%x (iso=%s audio=%s bcdUSB=0x%x)\n",
+				dev.getDeviceId(), possibleSpeeds, hasIsoEndpoint, hasAudioInterface, bcdUsb);
 
-		if ((possibleSpeeds & FLAG_POSSIBLE_SPEED_LOW) != 0) {
-			return UsbIpDevice.USB_SPEED_LOW;
-		}
-		else if ((possibleSpeeds & FLAG_POSSIBLE_SPEED_FULL) != 0) {
-			return UsbIpDevice.USB_SPEED_FULL;
-		}
-		else if ((possibleSpeeds & FLAG_POSSIBLE_SPEED_HIGH) != 0) {
-			return UsbIpDevice.USB_SPEED_HIGH;
-		}
-		else if ((possibleSpeeds & FLAG_POSSIBLE_SPEED_SUPER) != 0) {
-			return UsbIpDevice.USB_SPEED_SUPER;
-		}
-		else {
-			// Something went very wrong in speed detection
-			return UsbIpDevice.USB_SPEED_UNKNOWN;
-		}
+		return UsbSpeedHeuristics.detectSpeed(
+				(possibleSpeeds & FLAG_POSSIBLE_SPEED_LOW) != 0,
+				(possibleSpeeds & FLAG_POSSIBLE_SPEED_FULL) != 0,
+				(possibleSpeeds & FLAG_POSSIBLE_SPEED_HIGH) != 0,
+				(possibleSpeeds & FLAG_POSSIBLE_SPEED_SUPER) != 0,
+				hasIsoEndpoint,
+				hasAudioInterface,
+				bcdUsb);
 	}
 	
 	private static int deviceIdToBusNum(int deviceId) {
