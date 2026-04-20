@@ -204,7 +204,10 @@ einval:
  *  FIX-ISO-2    ISO descriptors: big-endian, correct offsets per direction
  *  FIX-ISO-3    Failed malloc -> error reply, not malformed packet
  *  FIX-HBW      High-bandwidth ISO: buffer_length = iso_sum not blen
+ *  FIX-ISO-4    Preserve ISO descriptor endianness per request
  *  FIX-STALL    CLEAR_HALT after -EPIPE on bulk/interrupt endpoints
+ *  FIX-CTRL-1   EP0 direction from setup.bRequestType (not USB/IP dir)
+ *  FIX-CTRL-2   Native SET_CONFIGURATION/SET_INTERFACE fast-path via usbfs ioctls
  *  FIX-MISC     ENODEV clean shutdown, use-after-free guard
  * =================================================================== */
 
@@ -246,7 +249,10 @@ struct usbip_iso_packet_descriptor {
 /* ---- Endian ---- */
 static uint32_t r32le(const uint8_t* p){return(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
 static uint32_t r32be(const uint8_t* p){return((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|(uint32_t)p[3];}
+static uint16_t r16le(const uint8_t* p){return(uint16_t)p[0]|((uint16_t)p[1]<<8);}
+static void w32le(uint8_t* p,uint32_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);p[2]=(uint8_t)(v>>16);p[3]=(uint8_t)(v>>24);}
 static void w32be(uint8_t* p,uint32_t v){p[0]=(uint8_t)(v>>24);p[1]=(uint8_t)(v>>16);p[2]=(uint8_t)(v>>8);p[3]=(uint8_t)v;}
+static void w32x(uint8_t* p,uint32_t v,int le){if(le)w32le(p,v);else w32be(p,v);}
 
 static int parse_iso(const uint8_t* raw,int n,int bl,int le,uint32_t* out){
     if(!raw||n<0||!out)return 0;
@@ -274,6 +280,7 @@ struct urb_ctx {
     void* buf;
     uint32_t seqnum, devid, dir, ep;
     int32_t  npkts;
+    uint8_t  iso_desc_le;
     struct urb_ctx* next;
     struct usbdevfs_urb urb;
 };
@@ -285,6 +292,22 @@ struct conn {
     pthread_mutex_t smtx, umtx;
     struct urb_ctx* urbs;
 };
+
+static int sndall(int fd,const void* b,size_t l,pthread_mutex_t* m);
+
+static void send_submit_simple(struct conn* c, const struct usbip_header_cmd_submit* sub,
+                               int32_t status, int32_t actual_length) {
+    struct usbip_header_ret_submit r;
+    memset(&r, 0, sizeof(r));
+    r.base.command = htonl(3);
+    r.base.seqnum = sub->base.seqnum;
+    r.base.devid = sub->base.devid;
+    r.base.direction = sub->base.direction;
+    r.base.ep = sub->base.ep;
+    r.status = htonl(status);
+    r.actual_length = htonl(actual_length);
+    sndall(c->tcpFd, &r, sizeof(r), &c->smtx);
+}
 
 /* ---- TCP I/O ---- */
 static int sndall(int fd,const void* b,size_t l,pthread_mutex_t* m){
@@ -354,6 +377,8 @@ static void* reaper(void* arg){
                 clrhalt(c->usbFd,rp->endpoint);
 
             int isin=(ntohl(x->dir)!=0), act=rp->actual_length, np=x->npkts;
+            if (rp->type == USBDEVFS_URB_TYPE_CONTROL && x->buf)
+                isin = ((((uint8_t*)x->buf)[0] & 0x80) != 0);
             struct usbip_header_ret_submit hdr;
             memset(&hdr,0,sizeof(hdr));
             hdr.base.command=htonl(3);hdr.base.seqnum=x->seqnum;hdr.base.devid=x->devid;
@@ -377,15 +402,22 @@ static void* reaper(void* arg){
                     for(int i=0;i<np;i++){
                         uint32_t fl=rp->iso_frame_desc[i].length,fa=rp->iso_frame_desc[i].actual_length,fs=rp->iso_frame_desc[i].status;
                         if(fa>0)memcpy((uint8_t*)pk+dst,(uint8_t*)x->buf+src,fa);
-                        /* FIX-ISO-2: big-endian, packed offsets */
-                        w32be(ds+i*16+0,off);w32be(ds+i*16+4,fl);w32be(ds+i*16+8,fa);w32be(ds+i*16+12,fs);
+                        /* Preserve descriptor endianness from submit path for better client compatibility */
+                        w32x(ds+i*16+0,off,x->iso_desc_le);
+                        w32x(ds+i*16+4,fl,x->iso_desc_le);
+                        w32x(ds+i*16+8,fa,x->iso_desc_le);
+                        w32x(ds+i*16+12,fs,x->iso_desc_le);
                         src+=fl;dst+=fa;off+=fa;
                     }
                     pay=pk;pl=dst;hdr.actual_length=htonl((int32_t)dst);
                 } else {
                     for(int i=0;i<np;i++){
                         uint32_t fl=rp->iso_frame_desc[i].length,fa=rp->iso_frame_desc[i].actual_length,fs=rp->iso_frame_desc[i].status;
-                        w32be(ds+i*16+0,off);w32be(ds+i*16+4,fl);w32be(ds+i*16+8,fa);w32be(ds+i*16+12,fs);off+=fl;
+                        w32x(ds+i*16+0,off,x->iso_desc_le);
+                        w32x(ds+i*16+4,fl,x->iso_desc_le);
+                        w32x(ds+i*16+8,fa,x->iso_desc_le);
+                        w32x(ds+i*16+12,fs,x->iso_desc_le);
+                        off+=fl;
                     }
                 }
             } else {
@@ -453,17 +485,46 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
             if(sf<0)sf=0; if(iv<0)iv=0;
 
             int utype=infer_type(ep,niso,iv); /* FIX-VOL-3 */
-            int dw=isout?blen:0;
-            int iw=niso*(int)sizeof(struct usbip_iso_packet_descriptor);
+            if (utype == USBDEVFS_URB_TYPE_CONTROL)
+                niso = 0;
+            int ctrl_in = (utype == USBDEVFS_URB_TYPE_CONTROL) && ((sub.setup[0] & 0x80) != 0);
+            int dw = (utype == USBDEVFS_URB_TYPE_CONTROL) ? (ctrl_in ? 0 : blen) : (isout ? blen : 0);
+            int iw = (utype == USBDEVFS_URB_TYPE_ISO) ? (niso * (int)sizeof(struct usbip_iso_packet_descriptor)) : 0;
             int vwl=dw+iw; if(vwl<0)break;
 
             uint8_t* vwd=NULL;
             if(vwl>0){vwd=malloc((size_t)vwl);if(!vwd)break;if(rcvall(cs->tcpFd,vwd,(size_t)vwl)<0){free(vwd);break;}}
 
+            if (utype == USBDEVFS_URB_TYPE_CONTROL) {
+                uint8_t reqType = sub.setup[0];
+                uint8_t req = sub.setup[1];
+                uint16_t wValue = r16le(&sub.setup[2]);
+                uint16_t wIndex = r16le(&sub.setup[4]);
+
+                if (reqType == 0x00 && req == 0x09) {
+                    unsigned int cfg = (unsigned int)(wValue & 0x00FF);
+                    if (ioctl(usbFd, USBDEVFS_SETCONFIGURATION, &cfg) == 0) {
+                        if (vwd) free(vwd);
+                        send_submit_simple(cs, &sub, 0, 0);
+                        continue;
+                    }
+                } else if (reqType == 0x01 && req == 0x0B) {
+                    struct usbdevfs_setinterface si;
+                    si.interface = (unsigned int)wIndex;
+                    si.altsetting = (unsigned int)wValue;
+                    if (ioctl(usbFd, USBDEVFS_SETINTERFACE, &si) == 0) {
+                        if (vwd) free(vwd);
+                        send_submit_simple(cs, &sub, 0, 0);
+                        continue;
+                    }
+                }
+            }
+
             struct urb_ctx* x=calloc(1,sizeof(struct urb_ctx)+sizeof(struct usbdevfs_iso_packet_desc)*niso);
             if(!x){if(vwd)free(vwd);break;}
             x->seqnum=sub.base.seqnum;x->devid=sub.base.devid;
             x->dir=sub.base.direction;x->ep=sub.base.ep;x->npkts=niso;
+            x->iso_desc_le=1;
 
             struct usbdevfs_urb* urb=&x->urb;
             urb->type=utype;
@@ -473,18 +534,18 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 uint32_t* pl=calloc((size_t)niso,sizeof(uint32_t));
                 if(!pl){if(vwd)free(vwd);free(x);break;}
                 int ok=0;
+                int desc_le=1;
                 if(iw>0&&vwd){
                     uint8_t* first=vwd,*last=vwd+dw;
-                    int limit = (isout && dw > 0) ? blen : 0x7FFFFFFF;
-                    int fl=parse_iso(first,niso,limit,1,pl),fb=!fl&&parse_iso(first,niso,limit,0,pl);
-                    int ll=(isout&&dw>0)?parse_iso(last,niso,limit,1,pl):0,lb=(isout&&dw>0&&!ll)?parse_iso(last,niso,limit,0,pl):0;
+                    int fl=parse_iso(first,niso,blen,1,pl),fb=!fl&&parse_iso(first,niso,blen,0,pl);
+                    int ll=(isout&&dw>0)?parse_iso(last,niso,blen,1,pl):0,lb=(isout&&dw>0&&!ll)?parse_iso(last,niso,blen,0,pl):0;
                     if(isout&&dw>0){
                         int uf=(fl||fb)&&!(ll||lb),ul=(ll||lb)&&!(fl||fb);if(!uf&&!ul)ul=1;
                         buf=malloc((size_t)dw);if(!buf){free(pl);if(vwd)free(vwd);free(x);break;}
-                        if(uf){memcpy(buf,vwd+iw,(size_t)dw);ok=parse_iso(first,niso,blen,1,pl)||parse_iso(first,niso,blen,0,pl);}
-                        else  {memcpy(buf,vwd,(size_t)dw);   ok=parse_iso(last, niso,blen,1,pl)||parse_iso(last, niso,blen,0,pl);}
+                        if(uf){memcpy(buf,vwd+iw,(size_t)dw);ok=fl||fb;desc_le=fl?1:0;}
+                        else  {memcpy(buf,vwd,(size_t)dw);   ok=ll||lb;desc_le=ll?1:0;}
                     } else {
-                        ok=parse_iso(first,niso,blen,1,pl)||parse_iso(first,niso,blen,0,pl);
+                        ok=fl||fb;desc_le=fl?1:0;
                     }
                 }
                 if(!ok){
@@ -492,6 +553,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                     errrep(cs,x,-EINVAL); free(x);
                     continue; /* FIX: Don't disconnect on malformed ISO descriptors */
                 }
+                x->iso_desc_le=(uint8_t)desc_le;
                 uint32_t isum=0;
                 for(int i=0;i<niso;i++){urb->iso_frame_desc[i].length=pl[i];urb->iso_frame_desc[i].actual_length=0;urb->iso_frame_desc[i].status=0;isum+=pl[i];}
                 free(pl);
@@ -505,7 +567,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 void* ctrl=malloc(8+(size_t)(blen>0?blen:0));
                 if(!ctrl){if(vwd)free(vwd);free(x);break;}
                 memcpy(ctrl,sub.setup,8);
-                if(isout&&dw>0&&vwd)memcpy((uint8_t*)ctrl+8,vwd,(size_t)dw);
+                if(dw>0&&vwd)memcpy((uint8_t*)ctrl+8,vwd,(size_t)dw);
                 x->buf=ctrl;urb->buffer=ctrl;urb->buffer_length=8+blen;
 
             } else { /* BULK or INTERRUPT */
