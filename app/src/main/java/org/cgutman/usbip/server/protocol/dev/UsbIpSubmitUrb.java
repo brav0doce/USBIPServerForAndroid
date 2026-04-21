@@ -77,11 +77,13 @@ public class UsbIpSubmitUrb extends UsbIpDevicePacket {
 			StreamUtils.readAll(in, variableData);
 
 			if (msg.numberOfPackets > 0) {
-				UsbIpIsoPacketDescriptor[] descFirst = UsbIpIsoPacketDescriptor.deserializeList(variableData, 0, msg.numberOfPackets);
+				UsbIpIsoPacketDescriptor[] descFirst = UsbIpIsoPacketDescriptor.deserializeListWithFallback(
+						variableData, 0, msg.numberOfPackets, msg.transferBufferLength);
 				boolean firstPlausible = UsbIpIsoPacketDescriptor.looksPlausible(descFirst, msg.transferBufferLength);
 
-				UsbIpIsoPacketDescriptor[] descLast = UsbIpIsoPacketDescriptor.deserializeList(
-						variableData, variableData.length - isoDescWireLength, msg.numberOfPackets);
+				UsbIpIsoPacketDescriptor[] descLast = UsbIpIsoPacketDescriptor.deserializeListWithFallback(
+						variableData, variableData.length - isoDescWireLength,
+						msg.numberOfPackets, msg.transferBufferLength);
 				boolean lastPlausible = UsbIpIsoPacketDescriptor.looksPlausible(descLast, msg.transferBufferLength);
 
 				if (msg.direction == UsbIpDevicePacket.USBIP_DIR_OUT) {

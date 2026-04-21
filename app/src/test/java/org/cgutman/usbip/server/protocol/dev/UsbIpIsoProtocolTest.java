@@ -14,6 +14,21 @@ import static org.junit.Assert.fail;
 
 public class UsbIpIsoProtocolTest {
 	private static byte[] buildSubmitPacket(boolean descriptorFirst) {
+		return buildSubmitPacket(descriptorFirst, ByteOrder.LITTLE_ENDIAN);
+	}
+
+	private static byte[] serializeDescriptors(UsbIpIsoPacketDescriptor[] descriptors, ByteOrder byteOrder) {
+		ByteBuffer bb = ByteBuffer.allocate(descriptors.length * UsbIpIsoPacketDescriptor.WIRE_SIZE).order(byteOrder);
+		for (UsbIpIsoPacketDescriptor descriptor : descriptors) {
+			bb.putInt(descriptor.offset);
+			bb.putInt(descriptor.length);
+			bb.putInt(descriptor.actualLength);
+			bb.putInt(descriptor.status);
+		}
+		return bb.array();
+	}
+
+	private static byte[] buildSubmitPacket(boolean descriptorFirst, ByteOrder descriptorByteOrder) {
 		int transferLength = 8;
 		int packetCount = 2;
 
@@ -40,7 +55,7 @@ public class UsbIpIsoProtocolTest {
 			descriptors[i].actualLength = 0;
 			descriptors[i].status = 0;
 		}
-		byte[] descriptorBytes = UsbIpIsoPacketDescriptor.serializeList(descriptors);
+		byte[] descriptorBytes = serializeDescriptors(descriptors, descriptorByteOrder);
 		byte[] outData = new byte[] { 10, 11, 12, 13, 20, 21, 22, 23 };
 
 		ByteBuffer packet = ByteBuffer.allocate(header.capacity() + submit.capacity() +
@@ -57,6 +72,22 @@ public class UsbIpIsoProtocolTest {
 		}
 
 		return packet.array();
+	}
+
+	@Test
+	public void parsesIsoSubmitWithBigEndianDescriptors() throws Exception {
+		byte[] raw = buildSubmitPacket(true, ByteOrder.BIG_ENDIAN);
+		UsbIpSubmitUrb submit = (UsbIpSubmitUrb) UsbIpDevicePacket.read(new ByteArrayInputStream(raw));
+
+		assertNotNull(submit);
+		assertEquals(2, submit.numberOfPackets);
+		assertNotNull(submit.isoPacketDescriptors);
+		assertEquals(2, submit.isoPacketDescriptors.length);
+		assertArrayEquals(new byte[] { 10, 11, 12, 13, 20, 21, 22, 23 }, submit.outData);
+		assertEquals(0, submit.isoPacketDescriptors[0].offset);
+		assertEquals(4, submit.isoPacketDescriptors[0].length);
+		assertEquals(4, submit.isoPacketDescriptors[1].offset);
+		assertEquals(4, submit.isoPacketDescriptors[1].length);
 	}
 
 	@Test
@@ -123,12 +154,48 @@ public class UsbIpIsoProtocolTest {
 		bb.get(payload);
 		assertArrayEquals(reply.inData, payload);
 
+		int descriptorOffset = 20 + (UsbIpDevicePacket.USBIP_HEADER_SIZE - 20) + 8;
+		ByteBuffer wire = ByteBuffer.wrap(serialized, descriptorOffset,
+				2 * UsbIpIsoPacketDescriptor.WIRE_SIZE).order(ByteOrder.BIG_ENDIAN);
+		assertEquals(0, wire.getInt());
+		assertEquals(4, wire.getInt());
+		assertEquals(4, wire.getInt());
+		assertEquals(0, wire.getInt());
+
 		UsbIpIsoPacketDescriptor[] descriptors = UsbIpIsoPacketDescriptor.deserializeList(
-				serialized, 20 + (UsbIpDevicePacket.USBIP_HEADER_SIZE - 20) + 8, 2);
+				serialized, descriptorOffset, 2);
 		assertEquals(0, descriptors[0].offset);
 		assertEquals(4, descriptors[0].length);
 		assertEquals(4, descriptors[1].offset);
 		assertEquals(4, descriptors[1].actualLength);
+	}
+
+	@Test
+	public void autoParserAcceptsLittleAndBigEndianDescriptors() {
+		UsbIpIsoPacketDescriptor d0 = new UsbIpIsoPacketDescriptor();
+		d0.offset = 0;
+		d0.length = 4;
+		d0.actualLength = 0;
+		d0.status = 0;
+
+		UsbIpIsoPacketDescriptor d1 = new UsbIpIsoPacketDescriptor();
+		d1.offset = 4;
+		d1.length = 4;
+		d1.actualLength = 0;
+		d1.status = 0;
+
+		UsbIpIsoPacketDescriptor[] expected = new UsbIpIsoPacketDescriptor[] { d0, d1 };
+		byte[] beWire = serializeDescriptors(expected, ByteOrder.BIG_ENDIAN);
+		byte[] leWire = serializeDescriptors(expected, ByteOrder.LITTLE_ENDIAN);
+
+		UsbIpIsoPacketDescriptor[] parsedBe = UsbIpIsoPacketDescriptor.deserializeListWithFallback(beWire, 0, 2, 8);
+		UsbIpIsoPacketDescriptor[] parsedLe = UsbIpIsoPacketDescriptor.deserializeListWithFallback(leWire, 0, 2, 8);
+
+		assertEquals(0, parsedBe[0].offset);
+		assertEquals(4, parsedBe[0].length);
+		assertEquals(4, parsedBe[1].offset);
+		assertEquals(4, parsedLe[0].length);
+		assertEquals(4, parsedLe[1].offset);
 	}
 
 	@Test

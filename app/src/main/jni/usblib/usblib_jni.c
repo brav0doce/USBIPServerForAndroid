@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <jni.h>
 #include <time.h>
+#include <sys/time.h>
 #include <errno.h>
 #include <limits.h>
 #include <linux/usbdevice_fs.h>
@@ -16,10 +17,115 @@
 #include <endian.h>
 #include <string.h>
 #include <signal.h>
+#include <libusb.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+
+#ifndef TEMP_FAILURE_RETRY
+#define TEMP_FAILURE_RETRY(exp) \
+    ({ \
+        typeof(exp) _rc; \
+        do { \
+            _rc = (exp); \
+        } while (_rc == -1 && errno == EINTR); \
+        _rc; \
+    })
+#endif
+
+static libusb_context* g_libusb_ctx;
+static pthread_once_t g_libusb_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_libusb_event_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void libusb_backend_init_once(void)
+{
+    if (libusb_init(&g_libusb_ctx) != 0) {
+        g_libusb_ctx = NULL;
+        return;
+    }
+
+#ifdef LIBUSB_OPTION_NO_DEVICE_DISCOVERY
+    /* Android permissions often allow only already-opened device fds. */
+    (void) libusb_set_option(g_libusb_ctx, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+#endif
+}
+
+static int libusb_error_to_errno(int err)
+{
+    if (err >= 0) {
+        return err;
+    }
+
+    switch (err) {
+    case LIBUSB_ERROR_IO:
+        return -EIO;
+    case LIBUSB_ERROR_INVALID_PARAM:
+        return -EINVAL;
+    case LIBUSB_ERROR_ACCESS:
+        return -EACCES;
+    case LIBUSB_ERROR_NO_DEVICE:
+        return -ENODEV;
+    case LIBUSB_ERROR_NOT_FOUND:
+        return -ENOENT;
+    case LIBUSB_ERROR_BUSY:
+        return -EBUSY;
+    case LIBUSB_ERROR_TIMEOUT:
+        return -ETIMEDOUT;
+    case LIBUSB_ERROR_OVERFLOW:
+        return -EOVERFLOW;
+    case LIBUSB_ERROR_PIPE:
+        return -EPIPE;
+    case LIBUSB_ERROR_INTERRUPTED:
+        return -EINTR;
+    case LIBUSB_ERROR_NO_MEM:
+        return -ENOMEM;
+    case LIBUSB_ERROR_NOT_SUPPORTED:
+        return -EOPNOTSUPP;
+    default:
+        return -EIO;
+    }
+}
+
+static int libusb_transfer_status_to_errno(enum libusb_transfer_status status)
+{
+    switch (status) {
+    case LIBUSB_TRANSFER_COMPLETED:
+        return 0;
+    case LIBUSB_TRANSFER_TIMED_OUT:
+        return -ETIMEDOUT;
+    case LIBUSB_TRANSFER_CANCELLED:
+        return -ECONNRESET;
+    case LIBUSB_TRANSFER_STALL:
+        return -EPIPE;
+    case LIBUSB_TRANSFER_NO_DEVICE:
+        return -ENODEV;
+    case LIBUSB_TRANSFER_OVERFLOW:
+        return -EOVERFLOW;
+    case LIBUSB_TRANSFER_ERROR:
+    default:
+        return -EIO;
+    }
+}
+
+static int libusb_wrap_fd(jint fd, libusb_device_handle** out_handle)
+{
+    if (!out_handle) {
+        return -EINVAL;
+    }
+
+    pthread_once(&g_libusb_once, libusb_backend_init_once);
+    if (!g_libusb_ctx) {
+        return -ENOSYS;
+    }
+
+    int err = libusb_wrap_sys_device(g_libusb_ctx, (intptr_t) fd, out_handle);
+    if (err != 0) {
+        return libusb_error_to_errno(err);
+    }
+
+    return 0;
+}
 
 /* ===================================================================
  *  JNI helper functions (doBulkTransfer, doControlTransfer, doIsoTransfer)
@@ -29,13 +135,47 @@ JNIEXPORT jint JNICALL
 Java_org_cgutman_usbip_jni_UsbLib_doBulkTransfer(
         JNIEnv *env, jclass clazz, jint fd, jint endpoint, jbyteArray data, jint timeout)
 {
+    (void)clazz;
     jbyte* dataPtr = data ? (jbyte*)(*env)->GetPrimitiveArrayCritical(env, data, NULL) : NULL;
     jsize dataLen = data ? (*env)->GetArrayLength(env, data) : 0;
-    struct usbdevfs_bulktransfer xfer = {
-        .ep = endpoint, .len = dataLen, .timeout = timeout, .data = dataPtr,
-    };
-    jint res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_BULK, &xfer));
-    if (res < 0) res = -errno;
+    jint res;
+
+    if (data && !dataPtr) {
+        return -ENOMEM;
+    }
+
+    libusb_device_handle* handle = NULL;
+    int wrap_res = libusb_wrap_fd(fd, &handle);
+    if (wrap_res == 0) {
+        int actual = 0;
+        int err = libusb_bulk_transfer(handle, (unsigned char) endpoint,
+                (unsigned char*) dataPtr, (int) dataLen, &actual,
+                timeout > 0 ? (unsigned int) timeout : 0);
+        if (err == 0) {
+            res = actual;
+        }
+        else {
+            if (err == LIBUSB_ERROR_PIPE) {
+                (void) libusb_clear_halt(handle, (unsigned char) endpoint);
+            }
+            res = libusb_error_to_errno(err);
+        }
+
+        libusb_close(handle);
+    }
+    else {
+        struct usbdevfs_bulktransfer xfer = {
+            .ep = endpoint,
+            .len = dataLen,
+            .timeout = timeout,
+            .data = dataPtr,
+        };
+        res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_BULK, &xfer));
+        if (res < 0) {
+            res = -errno;
+        }
+    }
+
     if (dataPtr)
         (*env)->ReleasePrimitiveArrayCritical(env, data, dataPtr,
                                               ((endpoint & 0x80) && (res > 0)) ? 0 : JNI_ABORT);
@@ -51,17 +191,158 @@ Java_org_cgutman_usbip_jni_UsbLib_doControlTransfer(
     jsize dataLen = data ? (*env)->GetArrayLength(env, data) : 0;
     if (length < 0 || (length > 0 && data == NULL) || length > dataLen) return -EINVAL;
     jbyte* dataPtr = data ? (jbyte*)(*env)->GetPrimitiveArrayCritical(env, data, NULL) : NULL;
-    struct usbdevfs_ctrltransfer xfer = {
-        .bRequestType = requestType, .bRequest = request,
-        .wValue = value, .wIndex = index, .wLength = length,
-        .timeout = timeout, .data = dataPtr,
-    };
-    jint res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_CONTROL, &xfer));
-    if (res < 0) res = -errno;
+    jint res;
+
+    if (data && !dataPtr) {
+        return -ENOMEM;
+    }
+
+    libusb_device_handle* handle = NULL;
+    int wrap_res = libusb_wrap_fd(fd, &handle);
+    if (wrap_res == 0) {
+        int err = libusb_control_transfer(handle,
+                (uint8_t) requestType,
+                (uint8_t) request,
+                (uint16_t) value,
+                (uint16_t) index,
+                (unsigned char*) dataPtr,
+                (uint16_t) length,
+                timeout > 0 ? (unsigned int) timeout : 0);
+        res = err >= 0 ? err : libusb_error_to_errno(err);
+        libusb_close(handle);
+    }
+    else {
+        struct usbdevfs_ctrltransfer xfer = {
+            .bRequestType = requestType,
+            .bRequest = request,
+            .wValue = value,
+            .wIndex = index,
+            .wLength = length,
+            .timeout = timeout,
+            .data = dataPtr,
+        };
+        res = TEMP_FAILURE_RETRY(ioctl(fd, USBDEVFS_CONTROL, &xfer));
+        if (res < 0) {
+            res = -errno;
+        }
+    }
+
     if (dataPtr)
         (*env)->ReleasePrimitiveArrayCritical(env, data, dataPtr,
                                               ((requestType & 0x80) && (res > 0)) ? 0 : JNI_ABORT);
     return res;
+}
+
+struct libusb_iso_wait_ctx {
+    int completed;
+};
+
+static void libusb_iso_transfer_cb(struct libusb_transfer* transfer)
+{
+    struct libusb_iso_wait_ctx* wait_ctx = (struct libusb_iso_wait_ctx*) transfer->user_data;
+    if (wait_ctx) {
+        wait_ctx->completed = 1;
+    }
+}
+
+static jint doIsoTransferWithLibusb(libusb_device_handle* handle, jint endpoint,
+        jbyte* data_ptr, jsize data_len, jint timeout, jsize packet_count,
+        jint* packet_lengths, jint* packet_actual_lengths, jint* packet_statuses,
+        jint* actual_length_out, jint* error_count_out)
+{
+    if (!handle || packet_count <= 0 || !packet_lengths ||
+            !packet_actual_lengths || !packet_statuses ||
+            !actual_length_out || !error_count_out) {
+        return -EINVAL;
+    }
+
+    struct libusb_transfer* transfer = libusb_alloc_transfer((int) packet_count);
+    if (!transfer) {
+        return -ENOMEM;
+    }
+
+    long long total_len = 0;
+    for (jsize i = 0; i < packet_count; i++) {
+        if (packet_lengths[i] < 0) {
+            libusb_free_transfer(transfer);
+            return -EINVAL;
+        }
+
+        total_len += packet_lengths[i];
+        if (total_len > INT_MAX || total_len > (long long) data_len) {
+            libusb_free_transfer(transfer);
+            return -EINVAL;
+        }
+    }
+
+    struct libusb_iso_wait_ctx wait_ctx = { 0 };
+    libusb_fill_iso_transfer(transfer,
+            handle,
+            (unsigned char) endpoint,
+            (unsigned char*) data_ptr,
+            (int) total_len,
+            (int) packet_count,
+            libusb_iso_transfer_cb,
+            &wait_ctx,
+            timeout > 0 ? (unsigned int) timeout : 0);
+
+    for (jsize i = 0; i < packet_count; i++) {
+        transfer->iso_packet_desc[i].length = (unsigned int) packet_lengths[i];
+    }
+
+    int submit_res = libusb_submit_transfer(transfer);
+    if (submit_res != 0) {
+        libusb_free_transfer(transfer);
+        return libusb_error_to_errno(submit_res);
+    }
+
+    int event_res = 0;
+    pthread_mutex_lock(&g_libusb_event_mutex);
+    while (!wait_ctx.completed) {
+        struct timeval tv = {
+            .tv_sec = 1,
+            .tv_usec = 0,
+        };
+
+        event_res = libusb_handle_events_timeout_completed(g_libusb_ctx, &tv, &wait_ctx.completed);
+        if (event_res == LIBUSB_ERROR_INTERRUPTED) {
+            continue;
+        }
+
+        if (event_res < 0) {
+            (void) libusb_cancel_transfer(transfer);
+            while (!wait_ctx.completed) {
+                int cancel_res = libusb_handle_events_timeout_completed(g_libusb_ctx, &tv, &wait_ctx.completed);
+                if (cancel_res == LIBUSB_ERROR_INTERRUPTED) {
+                    continue;
+                }
+                if (cancel_res < 0) {
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_libusb_event_mutex);
+            libusb_free_transfer(transfer);
+            return libusb_error_to_errno(event_res);
+        }
+    }
+    pthread_mutex_unlock(&g_libusb_event_mutex);
+
+    jint status = libusb_transfer_status_to_errno(transfer->status);
+    jint error_count = 0;
+    *actual_length_out = transfer->actual_length;
+
+    for (jsize i = 0; i < packet_count; i++) {
+        packet_actual_lengths[i] = (jint) transfer->iso_packet_desc[i].actual_length;
+        packet_statuses[i] = (jint) libusb_transfer_status_to_errno(
+                (enum libusb_transfer_status) transfer->iso_packet_desc[i].status);
+        if (packet_statuses[i] != 0) {
+            error_count++;
+        }
+    }
+
+    *error_count_out = error_count;
+    libusb_free_transfer(transfer);
+    return status;
 }
 
 static jintArray makeIsoResult(JNIEnv *env, jint st, jint al, jint ec) {
@@ -98,6 +379,27 @@ Java_org_cgutman_usbip_jni_UsbLib_doIsoTransfer(
         if (alp) (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, alp, JNI_ABORT);
         if (stp) (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, stp, JNI_ABORT);
         return makeIsoResult(env, -ENOMEM, 0, 0);
+    }
+
+    libusb_device_handle* handle = NULL;
+    int wrap_res = libusb_wrap_fd(fd, &handle);
+    if (wrap_res == 0) {
+        jint st = 0;
+        jint al = 0;
+        jint ec = 0;
+
+        st = doIsoTransferWithLibusb(handle, endpoint, dp, dl, timeout, pc,
+                plp, alp, stp, &al, &ec);
+        libusb_close(handle);
+
+        if (dp) {
+            (*env)->ReleasePrimitiveArrayCritical(env, data, dp,
+                    ((endpoint & 0x80) && (al > 0)) ? 0 : JNI_ABORT);
+        }
+        (*env)->ReleasePrimitiveArrayCritical(env, packet_lengths, plp, JNI_ABORT);
+        (*env)->ReleasePrimitiveArrayCritical(env, packet_actual_lengths, alp, 0);
+        (*env)->ReleasePrimitiveArrayCritical(env, packet_statuses, stp, 0);
+        return makeIsoResult(env, st, al, ec);
     }
 
     struct usbdevfs_urb* urb = calloc(1, sizeof(*urb) + pc * sizeof(struct usbdevfs_iso_packet_desc));
@@ -281,6 +583,7 @@ struct urb_ctx {
     uint32_t seqnum, devid, dir, ep;
     int32_t  npkts;
     uint8_t  iso_desc_le;
+    uint8_t  suppress_submit_ret;
     struct urb_ctx* next;
     struct usbdevfs_urb urb;
 };
@@ -313,7 +616,16 @@ static void send_submit_simple(struct conn* c, const struct usbip_header_cmd_sub
 static int sndall(int fd,const void* b,size_t l,pthread_mutex_t* m){
     const uint8_t* p=b;
     if(m)pthread_mutex_lock(m);
-    while(l>0){ssize_t n=send(fd,p,l,MSG_NOSIGNAL);if(n<=0){if(m)pthread_mutex_unlock(m);return -1;}p+=n;l-=n;}
+    while(l>0){
+        ssize_t n=send(fd,p,l,MSG_NOSIGNAL);
+        if(n<0){
+            if(errno==EINTR)continue;
+            if(m)pthread_mutex_unlock(m);
+            return -1;
+        }
+        if(n==0){if(m)pthread_mutex_unlock(m);return -1;}
+        p+=n;l-=n;
+    }
     if(m)pthread_mutex_unlock(m);
     return 0;
 }
@@ -321,20 +633,48 @@ static int snd3(int fd,const void* h,size_t hl,const void* d,size_t dl,const voi
     const uint8_t* B[3]={h,d,d2}; size_t L[3]={hl,dl,d2l};
     if(m)pthread_mutex_lock(m);
     for(int i=0;i<3;i++){if(!B[i]||!L[i])continue;const uint8_t* p=B[i];size_t r=L[i];
-        while(r>0){ssize_t n=send(fd,p,r,MSG_NOSIGNAL);if(n<=0){if(m)pthread_mutex_unlock(m);return -1;}p+=n;r-=n;}}
+        while(r>0){
+            ssize_t n=send(fd,p,r,MSG_NOSIGNAL);
+            if(n<0){
+                if(errno==EINTR)continue;
+                if(m)pthread_mutex_unlock(m);
+                return -1;
+            }
+            if(n==0){if(m)pthread_mutex_unlock(m);return -1;}
+            p+=n;r-=n;
+        }
+    }
     if(m)pthread_mutex_unlock(m);
     return 0;
 }
 static int rcvall(int fd,void* b,size_t l){
     uint8_t* p=b;
-    while(l>0){ssize_t n=recv(fd,p,l,MSG_WAITALL);if(n<=0)return -1;p+=n;l-=n;}
+    while(l>0){
+        ssize_t n=recv(fd,p,l,MSG_WAITALL);
+        if(n<0){
+            if(errno==EINTR)continue;
+            return -1;
+        }
+        if(n==0)return -1;
+        p+=n;l-=n;
+    }
+    return 0;
+}
+
+static int skipall(int fd,size_t l){
+    uint8_t scratch[1024];
+    while(l>0){
+        size_t n=l>sizeof(scratch)?sizeof(scratch):l;
+        if(rcvall(fd,scratch,n)<0)return -1;
+        l-=n;
+    }
     return 0;
 }
 
 /* ---- URB list ---- */
 static void add_u(struct conn* c,struct urb_ctx* x){pthread_mutex_lock(&c->umtx);x->next=c->urbs;c->urbs=x;pthread_mutex_unlock(&c->umtx);}
 static void del_u(struct conn* c,struct urb_ctx* x){pthread_mutex_lock(&c->umtx);struct urb_ctx**pp=&c->urbs;while(*pp){if(*pp==x){*pp=x->next;break;}pp=&(*pp)->next;}pthread_mutex_unlock(&c->umtx);}
-static struct urb_ctx* find_u(struct conn* c,uint32_t s){pthread_mutex_lock(&c->umtx);struct urb_ctx* x=c->urbs;while(x){if(x->seqnum==s){pthread_mutex_unlock(&c->umtx);return x;}x=x->next;}pthread_mutex_unlock(&c->umtx);return NULL;}
+static struct urb_ctx* find_u_locked(struct conn* c,uint32_t s){struct urb_ctx* x=c->urbs;while(x){if(x->seqnum==s)return x;x=x->next;}return NULL;}
 
 /* ---- Error reply ---- */
 static void errrep(struct conn* c,struct urb_ctx* x,int e){
@@ -371,6 +711,12 @@ static void* reaper(void* arg){
             struct urb_ctx* x=(struct urb_ctx*)rp->usercontext;
             if(!x)continue;
             del_u(c,x);
+
+            if(x->suppress_submit_ret){
+                if(x->buf)free(x->buf);
+                free(x);
+                continue;
+            }
 
             /* FIX-STALL */
             if(rp->status==-EPIPE && rp->type!=USBDEVFS_URB_TYPE_ISO)
@@ -493,7 +839,15 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
             int vwl=dw+iw; if(vwl<0)break;
 
             uint8_t* vwd=NULL;
-            if(vwl>0){vwd=malloc((size_t)vwl);if(!vwd)break;if(rcvall(cs->tcpFd,vwd,(size_t)vwl)<0){free(vwd);break;}}
+            if(vwl>0){
+                vwd=malloc((size_t)vwl);
+                if(!vwd){
+                    if(skipall(cs->tcpFd,(size_t)vwl)<0)break;
+                    send_submit_simple(cs,&sub,-ENOMEM,0);
+                    continue;
+                }
+                if(rcvall(cs->tcpFd,vwd,(size_t)vwl)<0){free(vwd);break;}
+            }
 
             if (utype == USBDEVFS_URB_TYPE_CONTROL) {
                 uint8_t reqType = sub.setup[0];
@@ -521,7 +875,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
             }
 
             struct urb_ctx* x=calloc(1,sizeof(struct urb_ctx)+sizeof(struct usbdevfs_iso_packet_desc)*niso);
-            if(!x){if(vwd)free(vwd);break;}
+            if(!x){if(vwd)free(vwd);send_submit_simple(cs,&sub,-ENOMEM,0);continue;}
             x->seqnum=sub.base.seqnum;x->devid=sub.base.devid;
             x->dir=sub.base.direction;x->ep=sub.base.ep;x->npkts=niso;
             x->iso_desc_le=1;
@@ -532,7 +886,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
 
             if(utype==USBDEVFS_URB_TYPE_ISO){
                 uint32_t* pl=calloc((size_t)niso,sizeof(uint32_t));
-                if(!pl){if(vwd)free(vwd);free(x);break;}
+                if(!pl){if(vwd)free(vwd);errrep(cs,x,-ENOMEM);free(x);continue;}
                 int ok=0;
                 int desc_le=1;
                 if(iw>0&&vwd){
@@ -541,7 +895,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                     int ll=(isout&&dw>0)?parse_iso(last,niso,blen,1,pl):0,lb=(isout&&dw>0&&!ll)?parse_iso(last,niso,blen,0,pl):0;
                     if(isout&&dw>0){
                         int uf=(fl||fb)&&!(ll||lb),ul=(ll||lb)&&!(fl||fb);if(!uf&&!ul)ul=1;
-                        buf=malloc((size_t)dw);if(!buf){free(pl);if(vwd)free(vwd);free(x);break;}
+                        buf=malloc((size_t)dw);if(!buf){free(pl);if(vwd)free(vwd);errrep(cs,x,-ENOMEM);free(x);continue;}
                         if(uf){memcpy(buf,vwd+iw,(size_t)dw);ok=fl||fb;desc_le=fl?1:0;}
                         else  {memcpy(buf,vwd,(size_t)dw);   ok=ll||lb;desc_le=ll?1:0;}
                     } else {
@@ -557,7 +911,7 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
                 uint32_t isum=0;
                 for(int i=0;i<niso;i++){urb->iso_frame_desc[i].length=pl[i];urb->iso_frame_desc[i].actual_length=0;urb->iso_frame_desc[i].status=0;isum+=pl[i];}
                 free(pl);
-                if(!buf&&isum>0){buf=calloc(1,(size_t)isum);if(!buf){if(vwd)free(vwd);free(x);break;}}
+                if(!buf&&isum>0){buf=calloc(1,(size_t)isum);if(!buf){if(vwd)free(vwd);errrep(cs,x,-ENOMEM);free(x);continue;}}
                 x->buf=buf;urb->buffer=buf;
                 /* FIX-HBW: buffer_length must equal sum of ISO descriptor lengths */
                 urb->buffer_length=(int)isum;
@@ -565,15 +919,15 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
             } else if(utype==USBDEVFS_URB_TYPE_CONTROL){
                 urb->endpoint=0;
                 void* ctrl=malloc(8+(size_t)(blen>0?blen:0));
-                if(!ctrl){if(vwd)free(vwd);free(x);break;}
+                if(!ctrl){if(vwd)free(vwd);send_submit_simple(cs,&sub,-ENOMEM,0);free(x);continue;}
                 memcpy(ctrl,sub.setup,8);
                 if(dw>0&&vwd)memcpy((uint8_t*)ctrl+8,vwd,(size_t)dw);
                 x->buf=ctrl;urb->buffer=ctrl;urb->buffer_length=8+blen;
 
             } else { /* BULK or INTERRUPT */
                 urb->endpoint=ep&0xFF; if(!isout)urb->endpoint|=0x80;
-                if(dw>0&&vwd){buf=malloc((size_t)dw);if(!buf){if(vwd)free(vwd);free(x);break;}memcpy(buf,vwd,(size_t)dw);}
-                else if(blen>0){buf=calloc(1,(size_t)blen);if(!buf){if(vwd)free(vwd);free(x);break;}}
+                if(dw>0&&vwd){buf=malloc((size_t)dw);if(!buf){if(vwd)free(vwd);send_submit_simple(cs,&sub,-ENOMEM,0);free(x);continue;}memcpy(buf,vwd,(size_t)dw);}
+                else if(blen>0){buf=calloc(1,(size_t)blen);if(!buf){if(vwd)free(vwd);send_submit_simple(cs,&sub,-ENOMEM,0);free(x);continue;}}
                 x->buf=buf;urb->buffer=buf;urb->buffer_length=blen;
             }
 
@@ -609,12 +963,26 @@ Java_org_cgutman_usbip_jni_UsbLib_runNativeDeviceLoop(
         } else if(cmd==2){ /* CMD_UNLINK */
             struct usbip_header_cmd_unlink unl; unl.base=base;
             if(rcvall(cs->tcpFd,((uint8_t*)&unl)+20,28)<0)break;
-            struct urb_ctx* tgt=find_u(cs,unl.unlink_seqnum);
-            if(tgt)ioctl(usbFd,USBDEVFS_DISCARDURB,&tgt->urb);
+            int unlink_status = 0;
+            pthread_mutex_lock(&cs->umtx);
+            struct urb_ctx* tgt=find_u_locked(cs,unl.unlink_seqnum);
+            if(tgt){
+                tgt->suppress_submit_ret=1;
+                if(ioctl(usbFd,USBDEVFS_DISCARDURB,&tgt->urb)==0){
+                    unlink_status = -ECONNRESET;
+                } else {
+                    int err = errno;
+                    tgt->suppress_submit_ret=0;
+                    if(err!=EINVAL && err!=ENOENT){
+                        unlink_status = -err;
+                    }
+                }
+            }
+            pthread_mutex_unlock(&cs->umtx);
             struct usbip_header_ret_unlink ret;
             memset(&ret,0,sizeof(ret));ret.base.command=htonl(4);ret.base.seqnum=unl.base.seqnum;
             ret.base.devid=unl.base.devid;ret.base.direction=unl.base.direction;ret.base.ep=unl.base.ep;
-            ret.status=htonl(tgt?-ECONNRESET:-ENOENT);
+            ret.status=htonl(unlink_status);
             sndall(cs->tcpFd,&ret,sizeof(ret),&cs->smtx);
         } else break;
     }

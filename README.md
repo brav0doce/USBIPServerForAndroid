@@ -10,6 +10,7 @@ An Android application that implements a **USB/IP server**, allowing USB devices
 
 - [What is USB/IP?](#what-is-usbip)
 - [How It Works](#how-it-works)
+   - [USB Class Libraries (outside USB/IP)](#usb-class-libraries-outside-usbip)
 - [Requirements](#requirements)
 - [How to Use](#how-to-use)
   - [Android (Server side)](#android-server-side)
@@ -50,9 +51,9 @@ This app implements the **server (stub) side** of that protocol on Android. You 
 2. **TCP server** – A foreground service starts a TCP server on port **3240** (the standard USB/IP port).
 3. **USB/IP handshake** – When a client connects, the server responds to `OP_REQ_DEVLIST` (list available devices) and `OP_REQ_IMPORT` (attach to a device) requests using the standard USB/IP wire protocol.
 4. **URB forwarding** – Once a device is claimed, every USB Request Block (URB) sent by the client (`USBIP_CMD_SUBMIT`) is translated into a real USB transfer on the Android side:
-   - **Bulk transfers** are performed via the `USBDEVFS_BULK` ioctl through a native JNI library (`libusblib.so`), which bypasses Android's Java USB API to achieve lower latency.
-   - **Control transfers** are performed via the `USBDEVFS_CONTROL` ioctl similarly.
-   - **Interrupt transfers** are handled through Android's `UsbRequest` API.
+   - **Bulk/control/iso helper path** is implemented in native code through vendored **libusb** (`third_party/libusb`) for a maintained and tested userspace USB stack.
+   - **Device-loop path (USB/IP async core)** continues to use low-level usbfs primitives where strict `SUBMIT/UNLINK` behavior and precise URB framing control are required.
+   - **Interrupt transfers** are submitted as endpoint transfers through the native backend.
    - Results are sent back to the client as `USBIP_RET_SUBMIT` replies.
 5. **Unlink** – `USBIP_CMD_UNLINK` (abort a pending URB) is also supported.
 6. **Wake locks** – The service holds a CPU wake lock and a high-performance Wi-Fi lock to prevent the connection from being interrupted by the power manager.
@@ -68,7 +69,23 @@ This app implements the **server (stub) side** of that protocol on Android. You 
 | `protocol/cli/` | Packets for the control channel (device list, import) |
 | `protocol/dev/` | Packets for the device channel (submit URB, unlink URB, replies) |
 | `usb/XferUtils.java` | USB transfer helpers (bulk, control, interrupt) |
-| `jni/usblib/usblib_jni.c` | Native C code performing `USBDEVFS_BULK` / `USBDEVFS_CONTROL` ioctls |
+| `jni/usblib/usblib_jni.c` | Native C code bridging USB/IP traffic to libusb/usbfs |
+| `jni/third_party/libusb/` | Vendored libusb source (LGPL 2.1+) used by native backend |
+
+### USB Class Libraries (outside USB/IP)
+
+If you are writing a direct USB app (not USB/IP passthrough), these libraries are usually better than generic raw transfers:
+
+| Use case | USB class/protocol | Recommended library |
+|------|---------|---------------------|
+| Keyboards, mice, gamepads, sensors | HID | `hidapi` |
+| Virtual COM / USB serial adapters | CDC/ACM, vendor serial bridges | `libserialport` |
+| Microphones, speakers, audio interfaces | UAC | `ALSA` (Linux), `PortAudio` (cross-platform) |
+| Webcams / capture devices | UVC | `libuvc` |
+| Cameras / photo transfer | PTP/MTP | `libgphoto2`, `libmtp` |
+| USB storage access | MSC | OS block/file APIs (`fopen`, `read`, mounted FS) |
+
+For embedded firmware/device-side USB stacks, use `TinyUSB` when possible.
 
 ---
 

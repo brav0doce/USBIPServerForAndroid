@@ -12,8 +12,13 @@ public class UsbIpIsoPacketDescriptor {
 	public int status;
 
 	public static UsbIpIsoPacketDescriptor[] deserializeList(byte[] data, int offset, int count) {
+		return deserializeList(data, offset, count, ByteOrder.BIG_ENDIAN);
+	}
+
+	public static UsbIpIsoPacketDescriptor[] deserializeList(byte[] data, int offset,
+			int count, ByteOrder byteOrder) {
 		UsbIpIsoPacketDescriptor[] descriptors = new UsbIpIsoPacketDescriptor[count];
-		ByteBuffer bb = ByteBuffer.wrap(data, offset, count * WIRE_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+		ByteBuffer bb = ByteBuffer.wrap(data, offset, count * WIRE_SIZE).order(byteOrder);
 		for (int i = 0; i < count; i++) {
 			UsbIpIsoPacketDescriptor descriptor = new UsbIpIsoPacketDescriptor();
 			descriptor.offset = bb.getInt();
@@ -25,12 +30,27 @@ public class UsbIpIsoPacketDescriptor {
 		return descriptors;
 	}
 
+	public static UsbIpIsoPacketDescriptor[] deserializeListWithFallback(byte[] data, int offset,
+			int count, int transferBufferLength) {
+		UsbIpIsoPacketDescriptor[] beDescriptors = deserializeList(data, offset, count, ByteOrder.BIG_ENDIAN);
+		if (looksPlausible(beDescriptors, transferBufferLength)) {
+			return beDescriptors;
+		}
+
+		UsbIpIsoPacketDescriptor[] leDescriptors = deserializeList(data, offset, count, ByteOrder.LITTLE_ENDIAN);
+		if (looksPlausible(leDescriptors, transferBufferLength)) {
+			return leDescriptors;
+		}
+
+		return beDescriptors;
+	}
+
 	public static byte[] serializeList(UsbIpIsoPacketDescriptor[] descriptors) {
 		if (descriptors == null || descriptors.length == 0) {
 			return new byte[0];
 		}
 
-		ByteBuffer bb = ByteBuffer.allocate(descriptors.length * WIRE_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+		ByteBuffer bb = ByteBuffer.allocate(descriptors.length * WIRE_SIZE).order(ByteOrder.BIG_ENDIAN);
 		for (UsbIpIsoPacketDescriptor descriptor : descriptors) {
 			bb.putInt(descriptor.offset);
 			bb.putInt(descriptor.length);
