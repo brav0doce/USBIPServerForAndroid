@@ -1,4 +1,4 @@
-LOCAL_PATH := $(call my-dir)
+ROOT_LOCAL_PATH := $(call my-dir)
 
-include $(LOCAL_PATH)/third_party/libusb/Android.mk
-include $(LOCAL_PATH)/usblib/Android.mk
+include $(ROOT_LOCAL_PATH)/third_party/libusb/Android.mk
+include $(ROOT_LOCAL_PATH)/usblib/Android.mk
