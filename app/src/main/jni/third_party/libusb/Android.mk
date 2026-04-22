@@ -4,7 +4,7 @@ LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
 
 LOCAL_MODULE := usb1_0
-LOCAL_MODULE_FILENAME := libusb1.0
+LOCAL_MODULE_FILENAME := libusb1_0
 
 LOCAL_SRC_FILES := \
     libusb/core.c \
