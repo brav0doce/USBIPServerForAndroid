@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <jni.h>
+#include <stdint.h>
 #include <time.h>
 #include <sys/time.h>
 #include <errno.h>
@@ -17,7 +18,7 @@
 #include <endian.h>
 #include <string.h>
 #include <signal.h>
-#include <libusb.h>
+#include "../third_party/libusb/libusb/libusb.h"
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -40,6 +41,21 @@ static pthread_mutex_t g_libusb_event_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void libusb_backend_init_once(void)
 {
+#ifdef LIBUSB_OPTION_NO_DEVICE_DISCOVERY
+    {
+        const struct libusb_init_option options[] = {
+            {
+                .option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY,
+                .value.ival = 1,
+            },
+        };
+
+        if (libusb_init_context(&g_libusb_ctx, options, 1) == 0) {
+            return;
+        }
+    }
+#endif
+
     if (libusb_init(&g_libusb_ctx) != 0) {
         g_libusb_ctx = NULL;
         return;
