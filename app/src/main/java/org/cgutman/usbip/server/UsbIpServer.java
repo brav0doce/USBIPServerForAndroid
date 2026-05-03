@@ -1,6 +1,8 @@
 package org.cgutman.usbip.server;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Map;
@@ -153,8 +155,14 @@ public class UsbIpServer {
 			@Override
 			public void run() {
 				try {
-					serverSock = new ServerSocket(PORT);
-					System.out.println("Server listening on "+PORT);
+					// Explicit wildcard bind so the server is reachable on every
+					// interface (Wi-Fi STA, hotspot AP, USB tethering, ethernet).
+					// setReuseAddress(true) avoids 'Address already in use' on
+					// fast restarts when the previous TIME_WAIT socket is still around.
+					serverSock = new ServerSocket();
+					serverSock.setReuseAddress(true);
+					serverSock.bind(new InetSocketAddress((InetAddress) null, PORT));
+					System.out.println("USB/IP server listening on 0.0.0.0:"+PORT);
 					while (!isInterrupted()) {
 						handleClient(serverSock.accept());
 					}

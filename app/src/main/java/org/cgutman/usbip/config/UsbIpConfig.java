@@ -1,5 +1,6 @@
 package org.cgutman.usbip.config;
 
+import org.cgutman.usbip.server.UsbIpServer;
 import org.cgutman.usbip.service.UsbIpService;
 import org.cgutman.usbipserverforandroid.R;
 
@@ -21,6 +22,14 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.core.content.ContextCompat;
 
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.List;
+
 public class UsbIpConfig extends ComponentActivity {
 	private Button serviceButton;
 	private TextView serviceStatus;
@@ -34,17 +43,63 @@ public class UsbIpConfig extends ComponentActivity {
 				startService(new Intent(UsbIpConfig.this, UsbIpService.class));
 			});
 	
+	// Returns labelled IPv4 addresses reachable on this device, e.g.
+	//   "wlan0: 192.168.1.34"  (Wi-Fi STA)
+	//   "ap0:   192.168.43.1"  (hotspot AP)
+	// We list them all because Android's hotspot interface usually has a
+	// different name and address than the STA Wi-Fi, and clients connecting
+	// over the hotspot must use the AP IP, not the STA one.
+	private static List<String> listReachableIPv4() {
+		List<String> out = new ArrayList<>();
+		try {
+			Enumeration<NetworkInterface> ifs = NetworkInterface.getNetworkInterfaces();
+			if (ifs == null) return out;
+			for (NetworkInterface ni : Collections.list(ifs)) {
+				if (!ni.isUp() || ni.isLoopback()) continue;
+				for (InetAddress ia : Collections.list(ni.getInetAddresses())) {
+					if (ia instanceof Inet4Address && !ia.isLoopbackAddress() && !ia.isLinkLocalAddress()) {
+						out.add(ni.getName() + ": " + ia.getHostAddress());
+					}
+				}
+			}
+		} catch (Exception e) {
+			// Best effort; if NetworkInterface enumeration fails we just show fewer hints.
+		}
+		return out;
+	}
+
 	private void updateStatus() {
 		if (running) {
 			serviceButton.setText("Stop Service");
 			serviceStatus.setText("USB/IP Service Running");
-			serviceReadyText.setText(R.string.ready_text);
+
+			StringBuilder sb = new StringBuilder();
+			sb.append(getString(R.string.ready_text));
+			sb.append("\n\nListening on TCP port ").append(UsbIpServer.PORT).append(" on:\n");
+			List<String> ips = listReachableIPv4();
+			if (ips.isEmpty()) {
+				sb.append("(no active IPv4 interface detected)");
+			} else {
+				for (String ip : ips) {
+					sb.append("  ").append(ip).append('\n');
+				}
+			}
+			serviceReadyText.setText(sb.toString());
 		}
 		else {
 			serviceButton.setText("Start Service");
 			serviceStatus.setText("USB/IP Service Stopped");
 			serviceReadyText.setText("");
 		}
+	}
+
+	@Override
+	protected void onResume() {
+		super.onResume();
+		// Re-check service state and refresh the IP list whenever the user
+		// returns to the activity (e.g. after toggling Wi-Fi / hotspot).
+		running = isMyServiceRunning(UsbIpService.class);
+		updateStatus();
 	}
 	
 	// Elegant Stack Overflow solution to querying running services
